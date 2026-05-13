@@ -9,7 +9,6 @@
 #include <netdb.h>
 
 int main(int argc, char **argv) {
-  // Flush after every std::cout / std::cerr
   std::cout << std::unitbuf;
   std::cerr << std::unitbuf;
   
@@ -42,7 +41,7 @@ int main(int argc, char **argv) {
     std::cerr << "listen failed\n";
     return 1;
   }
-  
+
   struct sockaddr_in client_addr;
   int client_addr_len = sizeof(client_addr);
   std::cout << "Waiting for a client to connect...\n";
@@ -56,8 +55,16 @@ int main(int argc, char **argv) {
   // accept(server_fd, (struct sockaddr *) &client_addr, (socklen_t *) &client_addr_len);
   std::cout << "Client connected\n";
   
-  const char *response = "+PONG\r\n";
-  send(client_fd, response, strlen(response), 0);
+  // const char *response = "+PONG\r\n";
+  // send(client_fd, response, strlen(response), 0);
+  char buffer[1024];
+  while(true){
+    int bytes_received = recv(client_fd, buffer, sizeof(buffer), 0);
+    if(bytes_received <= 0){ break;}
+    const char *response = "+PONG\r\n";
+    send(client_fd, response, strlen(response), 0);
+  }
+
 
   close(client_fd);
   close(server_fd);

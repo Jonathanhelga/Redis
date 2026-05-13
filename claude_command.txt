@@ -1,0 +1,20 @@
+The Complete Command Reference
+Here’s your cheat sheet. Screenshot this.
+Setup Once:
+    /init : Auto-generate project documentation.
+    /memory : Set global preferences forever.
+    /pr_comments : Load GitHub PR comments into context.
+Daily Use:
+    /btw : Ask side questions without interrupting.
+    /compact : Compress conversation, keep going.
+    ! command : Run shell without leaving.
+    /cost : Check your token usage.
+Power Moves:
+    /fast : Toggle faster responses.
+    /review : Systematic code review.
+    /model : Switch models mid-session.
+When Things Go Wrong:
+    /clear : Wipe conversation, keep setup.
+    /doctor : Check your setup health.
+    /terminal-setup : Fix terminal integration.
+    /help : See all available commands.
