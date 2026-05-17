@@ -48,7 +48,7 @@ int main(int argc, char **argv) {
   std::cout << "Sent: " << request;
 
   char buffer[1024];
-  ssize_t n = recv(sock, buffer, sizeof(buffer) - 1, 0); //Reading a response into a buffer
+  size_t n = recv(sock, buffer, sizeof(buffer) - 1, 0); //Reading a response into a buffer
   if (n < 0) {
     std::cerr << "recv failed\n";
     close(sock);
