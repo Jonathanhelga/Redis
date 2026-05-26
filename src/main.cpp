@@ -18,11 +18,56 @@ static bool set_nonblocking(int fd) {
   return fcntl(fd, F_SETFL, flags | O_NONBLOCK) >= 0;
 }
 
+// Parse a single RESP command (an array of bulk strings) from `input`.
+// On success, fills `args` with the command name + arguments and returns true.
+// Returns false if the buffer doesn't contain a complete, well-formed command.
+static bool parse_command(const std::string &input, std::vector<std::string> &args) {
+  args.clear();
+  size_t pos = 0;
+  if (pos >= input.size() || input[pos] != '*') return false;
+  ++pos;
+
+  size_t crlf = input.find("\r\n", pos);
+  if (crlf == std::string::npos) return false;
+  long count = std::strtol(input.substr(pos, crlf - pos).c_str(), nullptr, 10);
+  if (count <= 0) return false;
+  pos = crlf + 2;
+
+  for (long i = 0; i < count; ++i) {
+    if (pos >= input.size() || input[pos] != '$') return false;
+    ++pos;
+    crlf = input.find("\r\n", pos);
+    if (crlf == std::string::npos) return false;
+    long len = std::strtol(input.substr(pos, crlf - pos).c_str(), nullptr, 10);
+    if (len < 0) return false;
+    pos = crlf + 2;
+    if (pos + (size_t)len + 2 > input.size()) return false;  // incomplete
+    args.push_back(input.substr(pos, len));
+    pos += len + 2;  // skip data + trailing \r\n
+  }
+  return true;
+}
+
+// Encode `s` as a RESP bulk string: $<len>\r\n<data>\r\n
+static std::string encode_bulk_string(const std::string &s) {
+  return "$" + std::to_string(s.size()) + "\r\n" + s + "\r\n";
+}
+
+static bool iequals(const std::string &a, const char *b) {
+  return strcasecmp(a.c_str(), b) == 0;
+}
+
 int main(int argc, char **argv) {
   std::cout << std::unitbuf;
   std::cerr << std::unitbuf;
+  //flushes the stream after every insertion, without this I might see no output before a crash.
 
   int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+  //socket(domain, type, protocol) returns a new socket fd (file descriptor), or -1 on error. is like calling the phone company and saying "I want a phone", they give me back a number
+  // server_fd is what we refer to that phone from now
+  //AF_INET = IPv4 address family
+  //SOCK_STREAM =  a reliable, ordered byte stream → TCP.
+  //0 = let the kernel pick the default protocol for that family/type (TCP for AF_INET+SOCK_STREAM).
   if (server_fd < 0) {
     std::cerr << "Failed to create server socket\n";
     return 1;
@@ -30,7 +75,8 @@ int main(int argc, char **argv) {
 
   int reuse = 1;
   if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
-    std::cerr << "setsockopt failed\n";
+  // setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) it allows rebind to the port quickly after restarts(avoids "Address already in use")
+    std::cerr << "setsockopt failed\n";                     
     return 1;
   }
 
@@ -67,26 +113,31 @@ int main(int argc, char **argv) {
       std::cerr << "poll failed\n";
       break;
     }
-
+    
     // Accept new connections.
-    if (fds[0].revents & POLLIN) {
-      while (true) {
-        struct sockaddr_in client_addr;
-        socklen_t client_addr_len = sizeof(client_addr);
-        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
-        if (client_fd < 0) {
-          if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-          std::cerr << "accept failed\n";
-          break;
+    if (fds[0].revents != 0) {
+      --n;
+      if (fds[0].revents & POLLIN) {
+        while (true) {
+          struct sockaddr_in client_addr;
+          socklen_t client_addr_len = sizeof(client_addr);
+          int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
+          if (client_fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            std::cerr << "accept failed\n";
+            break;
+          }
+          set_nonblocking(client_fd);
+          fds.push_back({client_fd, POLLIN, 0});
+          std::cout << "Client connected (fd=" << client_fd << ")\n";
         }
-        set_nonblocking(client_fd);
-        fds.push_back({client_fd, POLLIN, 0});
-        std::cout << "Client connected (fd=" << client_fd << ")\n";
       }
     }
 
-    // Handle existing clients.
-    for (size_t i = 1; i < fds.size();) {
+    // Handle existing clients — stop once we've found every flagged fd.
+    for (size_t i = 1; i < fds.size() && n > 0;) {
+      if (fds[i].revents == 0) { ++i; continue; }
+      --n;
       bool drop = false;
       if (fds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
         drop = true;
@@ -94,21 +145,29 @@ int main(int argc, char **argv) {
         char buffer[1024];
         int bytes_received = recv(fds[i].fd, buffer, sizeof(buffer), 0);
         if (bytes_received > 0) {
-          const char *response = "+PONG\r\n";
-          send(fds[i].fd, response, strlen(response), 0);
-        } else if (bytes_received == 0) {
-          drop = true;
-        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-          drop = true;
+          std::string input(buffer, bytes_received);
+          std::vector<std::string> args;
+          std::string response;
+          if (parse_command(input, args) && !args.empty()) {
+            if (iequals(args[0], "ECHO") && args.size() >= 2) {
+              response = encode_bulk_string(args[1]);
+            } else {
+              response = "+PONG\r\n";
+            }
+          } else {
+            response = "+PONG\r\n";
+          }
+          send(fds[i].fd, response.c_str(), response.size(), 0);
         }
+        else if (bytes_received == 0) { drop = true;}
+        else if (errno != EAGAIN && errno != EWOULDBLOCK) { drop = true; }
       }
 
       if (drop) {
         close(fds[i].fd);
         fds.erase(fds.begin() + i);
-      } else {
-        ++i;
       }
+      else {++i;}
     }
   }
 
