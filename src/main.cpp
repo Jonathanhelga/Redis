@@ -119,6 +119,8 @@ int main(int argc, char **argv) {
 
   // The key-value store, shared across all clients.
   std::unordered_map<std::string, Entry> store;
+  // List store, keyed separately from the string store.
+  std::unordered_map<std::string, std::vector<std::string>> lists;
 
   while (true) {
     int n = poll(fds.data(), fds.size(), -1);
@@ -188,6 +190,12 @@ int main(int argc, char **argv) {
               } else {
                 response = "$-1\r\n";  // null bulk string: key not found / expired
               }
+            } else if (iequals(args[0], "RPUSH") && args.size() >= 3) {
+              auto &list = lists[args[1]];  // creates an empty list if absent
+              for (size_t a = 2; a < args.size(); ++a) {
+                list.push_back(args[a]);
+              }
+              response = ":" + std::to_string(list.size()) + "\r\n";
             } else {
               response = "+PONG\r\n";
             }
