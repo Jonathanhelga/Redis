@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <vector>
 #include <unordered_map>
+#include <chrono>
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -58,6 +59,15 @@ static bool iequals(const std::string &a, const char *b) {
   return strcasecmp(a.c_str(), b) == 0;
 }
 
+using Clock = std::chrono::steady_clock;
+
+// A stored value, with an optional expiry deadline.
+struct Entry {
+  std::string value;
+  bool has_expiry = false;
+  Clock::time_point expires_at;
+};
+
 int main(int argc, char **argv) {
   std::cout << std::unitbuf;
   std::cerr << std::unitbuf;
@@ -108,7 +118,7 @@ int main(int argc, char **argv) {
   fds.push_back({server_fd, POLLIN, 0});
 
   // The key-value store, shared across all clients.
-  std::unordered_map<std::string, std::string> store;
+  std::unordered_map<std::string, Entry> store;
 
   while (true) {
     int n = poll(fds.data(), fds.size(), -1);
@@ -156,14 +166,27 @@ int main(int argc, char **argv) {
             if (iequals(args[0], "ECHO") && args.size() >= 2) {
               response = encode_bulk_string(args[1]);
             } else if (iequals(args[0], "SET") && args.size() >= 3) {
-              store[args[1]] = args[2];
+              Entry entry;
+              entry.value = args[2];
+              // Optional: SET key value PX <milliseconds>
+              if (args.size() >= 5 && iequals(args[3], "PX")) {
+                long ms = std::strtol(args[4].c_str(), nullptr, 10);
+                entry.has_expiry = true;
+                entry.expires_at = Clock::now() + std::chrono::milliseconds(ms);
+              }
+              store[args[1]] = std::move(entry);
               response = "+OK\r\n";
             } else if (iequals(args[0], "GET") && args.size() >= 2) {
               auto it = store.find(args[1]);
+              if (it != store.end() && it->second.has_expiry &&
+                  Clock::now() >= it->second.expires_at) {
+                store.erase(it);          // lazily drop the expired key
+                it = store.end();
+              }
               if (it != store.end()) {
-                response = encode_bulk_string(it->second);
+                response = encode_bulk_string(it->second.value);
               } else {
-                response = "$-1\r\n";  // null bulk string: key not found
+                response = "$-1\r\n";  // null bulk string: key not found / expired
               }
             } else {
               response = "+PONG\r\n";
