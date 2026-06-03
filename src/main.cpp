@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cerrno>
 #include <vector>
+#include <unordered_map>
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -106,6 +107,9 @@ int main(int argc, char **argv) {
   std::vector<pollfd> fds;
   fds.push_back({server_fd, POLLIN, 0});
 
+  // The key-value store, shared across all clients.
+  std::unordered_map<std::string, std::string> store;
+
   while (true) {
     int n = poll(fds.data(), fds.size(), -1);
     if (n < 0) {
@@ -151,6 +155,16 @@ int main(int argc, char **argv) {
           if (parse_command(input, args) && !args.empty()) {
             if (iequals(args[0], "ECHO") && args.size() >= 2) {
               response = encode_bulk_string(args[1]);
+            } else if (iequals(args[0], "SET") && args.size() >= 3) {
+              store[args[1]] = args[2];
+              response = "+OK\r\n";
+            } else if (iequals(args[0], "GET") && args.size() >= 2) {
+              auto it = store.find(args[1]);
+              if (it != store.end()) {
+                response = encode_bulk_string(it->second);
+              } else {
+                response = "$-1\r\n";  // null bulk string: key not found
+              }
             } else {
               response = "+PONG\r\n";
             }
