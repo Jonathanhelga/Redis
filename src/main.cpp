@@ -448,7 +448,7 @@ int main(int argc, char **argv) {
                 }
 
                 if (!id_valid) {
-                  response = "-ERR The ID specified in XADD is equal or smaller than the previous one\r\n";
+                  response = "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n";
                 } else {
                   StreamEntry entry;
                   entry.id = final_id;
