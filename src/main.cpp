@@ -78,6 +78,12 @@ struct Entry {
   Clock::time_point expires_at;
 };
 
+// A single entry in a stream: an ID plus an ordered list of field-value pairs.
+struct StreamEntry {
+  std::string id;
+  std::vector<std::pair<std::string, std::string>> fields;
+};
+
 struct BlockedEntry {
   int fd;
   std::vector<std::string> keys;
@@ -165,6 +171,8 @@ int main(int argc, char **argv) {
   std::unordered_map<std::string, Entry> store;
   // List store, keyed separately from the string store.
   std::unordered_map<std::string, std::vector<std::string>> lists;
+  // Stream store, keyed separately from strings and lists.
+  std::unordered_map<std::string, std::vector<StreamEntry>> streams;
   std::vector<BlockedEntry> blocked_clients;
   std::unordered_set<int> blocked_fds;
 
@@ -358,9 +366,19 @@ int main(int argc, char **argv) {
                 response = "+string\r\n";
               } else if (lists.find(args[1]) != lists.end()) {
                 response = "+list\r\n";
+              } else if (streams.find(args[1]) != streams.end()) {
+                response = "+stream\r\n";
               } else {
                 response = "+none\r\n";
               }
+            } else if (iequals(args[0], "XADD") && args.size() >= 5 && (args.size() % 2) == 1) {
+              StreamEntry entry;
+              entry.id = args[2];
+              for (size_t a = 3; a < args.size(); a += 2) {
+                entry.fields.emplace_back(args[a], args[a + 1]);
+              }
+              streams[args[1]].push_back(std::move(entry));
+              response = encode_bulk_string(args[2]);
             } else {
               response = "+PONG\r\n";
             }
