@@ -347,6 +347,20 @@ int main(int argc, char **argv) {
                 }
               }
               response = encode_array(range);
+            } else if (iequals(args[0], "TYPE") && args.size() >= 2) {
+              auto it = store.find(args[1]);
+              if (it != store.end() && it->second.has_expiry &&
+                  Clock::now() >= it->second.expires_at) {
+                store.erase(it);
+                it = store.end();
+              }
+              if (it != store.end()) {
+                response = "+string\r\n";
+              } else if (lists.find(args[1]) != lists.end()) {
+                response = "+list\r\n";
+              } else {
+                response = "+none\r\n";
+              }
             } else {
               response = "+PONG\r\n";
             }
