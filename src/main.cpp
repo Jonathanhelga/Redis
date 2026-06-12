@@ -280,7 +280,7 @@ int main(int argc, char **argv) {
               response = ":" + std::to_string(list.size()) + "\r\n";
               try_unblock(args[1], lists, blocked_clients, blocked_fds);
             } else if (iequals(args[0], "BLPOP") && args.size() >= 3) {
-              long timeout_secs = std::strtol(args.back().c_str(), nullptr, 10);
+              double timeout_secs = std::strtod(args.back().c_str(), nullptr);
               bool found = false;
               for (size_t a = 1; a < args.size() - 1; ++a) {
                 const std::string &key = args[a];
@@ -300,7 +300,7 @@ int main(int argc, char **argv) {
                   keys.push_back(args[a]);
                 Clock::time_point deadline = Clock::time_point::max();
                 if (timeout_secs > 0)
-                  deadline = Clock::now() + std::chrono::seconds(timeout_secs);
+                  deadline = Clock::now() + std::chrono::milliseconds(static_cast<long>(timeout_secs * 1000));
                 blocked_clients.push_back({fds[i].fd, std::move(keys), deadline});
                 blocked_fds.insert(fds[i].fd);
               }
