@@ -194,7 +194,7 @@ int main(int argc, char **argv) {
       auto now = Clock::now();
       for (auto it = blocked_clients.begin(); it != blocked_clients.end(); ) {
         if (it->deadline != Clock::time_point::max() && now >= it->deadline) {
-          std::string resp = "$-1\r\n";
+          std::string resp = "*-1\r\n";
           send(it->fd, resp.c_str(), resp.size(), 0);
           blocked_fds.erase(it->fd);
           it = blocked_clients.erase(it);
