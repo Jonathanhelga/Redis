@@ -211,6 +211,10 @@ int main(int argc, char **argv) {
                 list.insert(list.begin(), args[a]);
               }
               response = ":" + std::to_string(list.size()) + "\r\n";
+            } else if (iequals(args[0], "LLEN") && args.size() >= 2) {
+              auto it = lists.find(args[1]);
+              long len = (it != lists.end()) ? (long)it->second.size() : 0;
+              response = ":" + std::to_string(len) + "\r\n";
             } else if (iequals(args[0], "LRANGE") && args.size() >= 4) {
               long start = std::strtol(args[2].c_str(), nullptr, 10);
               long stop = std::strtol(args[3].c_str(), nullptr, 10);

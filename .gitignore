@@ -1045,3 +1045,7 @@ dkms.conf
 *.dis
 
 vcpkg_installed
+
+# OpenCode
+.opencode/
+AGENTS.md
