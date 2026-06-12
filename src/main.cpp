@@ -444,7 +444,7 @@ int main(int argc, char **argv) {
                 } else {
                   if (ms < last_ms || (ms == last_ms && seq <= last_seq)) {
                     id_valid = false;
-                    if (!stream_exists && ms == 0 && seq == 0) {
+                    if (ms == 0 && seq == 0) {
                       response = "-ERR The ID specified in XADD must be greater than 0-0\r\n";
                     } else {
                       response = "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n";
