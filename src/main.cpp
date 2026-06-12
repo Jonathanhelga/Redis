@@ -215,6 +215,19 @@ int main(int argc, char **argv) {
               auto it = lists.find(args[1]);
               long len = (it != lists.end()) ? (long)it->second.size() : 0;
               response = ":" + std::to_string(len) + "\r\n";
+            } else if (iequals(args[0], "LPOP") && args.size() >= 3) {
+              long count = std::strtol(args[2].c_str(), nullptr, 10);
+              auto it = lists.find(args[1]);
+              if (it == lists.end()) {
+                response = "*-1\r\n";  // null array: missing list
+              } else {
+                if (count < 0) count = 0;
+                if (count > (long)it->second.size()) count = (long)it->second.size();
+                std::vector<std::string> popped(it->second.begin(), it->second.begin() + count);
+                it->second.erase(it->second.begin(), it->second.begin() + count);
+                if (it->second.empty()) lists.erase(it);  // Redis deletes empty lists
+                response = encode_array(popped);
+              }
             } else if (iequals(args[0], "LPOP") && args.size() >= 2) {
               auto it = lists.find(args[1]);
               if (it != lists.end() && !it->second.empty()) {
