@@ -55,6 +55,15 @@ static std::string encode_bulk_string(const std::string &s) {
   return "$" + std::to_string(s.size()) + "\r\n" + s + "\r\n";
 }
 
+// Encode a RESP array of bulk strings: *<count>\r\n followed by each element.
+static std::string encode_array(const std::vector<std::string> &items) {
+  std::string out = "*" + std::to_string(items.size()) + "\r\n";
+  for (const auto &item : items) {
+    out += encode_bulk_string(item);
+  }
+  return out;
+}
+
 static bool iequals(const std::string &a, const char *b) {
   return strcasecmp(a.c_str(), b) == 0;
 }
@@ -196,6 +205,23 @@ int main(int argc, char **argv) {
                 list.push_back(args[a]);
               }
               response = ":" + std::to_string(list.size()) + "\r\n";
+            } else if (iequals(args[0], "LRANGE") && args.size() >= 4) {
+              long start = std::strtol(args[2].c_str(), nullptr, 10);
+              long stop = std::strtol(args[3].c_str(), nullptr, 10);
+              std::vector<std::string> range;
+              auto it = lists.find(args[1]);
+              if (it != lists.end()) {
+                long size = (long)it->second.size();
+                // Negative indexes count from the end (-1 is the last element).
+                if (start < 0) start += size;
+                if (stop < 0) stop += size;
+                if (start < 0) start = 0;
+                if (stop >= size) stop = size - 1;
+                for (long idx = start; idx <= stop; ++idx) {
+                  range.push_back(it->second[idx]);
+                }
+              }
+              response = encode_array(range);
             } else {
               response = "+PONG\r\n";
             }
