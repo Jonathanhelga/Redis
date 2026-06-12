@@ -405,10 +405,11 @@ int main(int argc, char **argv) {
               if (!parse_ok) {
                 response = "-ERR Invalid stream ID specified\r\n";
               } else {
-                auto &stream = streams[key];
+                auto stream_it = streams.find(key);
+                bool stream_exists = stream_it != streams.end();
                 unsigned long long last_ms = 0, last_seq = 0;
-                if (!stream.empty()) {
-                  const std::string &last_id = stream.back().id;
+                if (stream_exists && !stream_it->second.empty()) {
+                  const std::string &last_id = stream_it->second.back().id;
                   auto d = last_id.find('-');
                   last_ms = std::strtoull(last_id.substr(0, d).c_str(), nullptr, 10);
                   last_seq = std::strtoull(last_id.substr(d + 1).c_str(), nullptr, 10);
@@ -443,7 +444,7 @@ int main(int argc, char **argv) {
                 } else {
                   if (ms < last_ms || (ms == last_ms && seq <= last_seq)) {
                     id_valid = false;
-                    if (stream.empty() && ms == 0 && seq == 0) {
+                    if (!stream_exists && ms == 0 && seq == 0) {
                       response = "-ERR The ID specified in XADD must be greater than 0-0\r\n";
                     } else {
                       response = "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n";
@@ -459,7 +460,7 @@ int main(int argc, char **argv) {
                   for (size_t a = 3; a < args.size(); a += 2) {
                     entry.fields.emplace_back(args[a], args[a + 1]);
                   }
-                  stream.push_back(std::move(entry));
+                  streams[key].push_back(std::move(entry));
                   response = encode_bulk_string(final_id);
                 }
               }
