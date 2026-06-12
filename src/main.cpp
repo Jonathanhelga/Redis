@@ -432,24 +432,28 @@ int main(int argc, char **argv) {
                 } else if (auto_seq) {
                   if (ms > last_ms) {
                     seq = 0;
+                    final_id = std::to_string(ms) + "-" + std::to_string(seq);
                   } else if (ms == last_ms) {
                     seq = last_seq + 1;
+                    final_id = std::to_string(ms) + "-" + std::to_string(seq);
                   } else {
                     id_valid = false;
-                  }
-                  if (id_valid) {
-                    final_id = std::to_string(ms) + "-" + std::to_string(seq);
+                    response = "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n";
                   }
                 } else {
                   if (ms < last_ms || (ms == last_ms && seq <= last_seq)) {
                     id_valid = false;
+                    if (stream.empty() && ms == 0 && seq == 0) {
+                      response = "-ERR The ID specified in XADD must be greater than 0-0\r\n";
+                    } else {
+                      response = "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n";
+                    }
+                  } else {
+                    final_id = id_str;
                   }
-                  if (id_valid) final_id = id_str;
                 }
 
-                if (!id_valid) {
-                  response = "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n";
-                } else {
+                if (id_valid) {
                   StreamEntry entry;
                   entry.id = final_id;
                   for (size_t a = 3; a < args.size(); a += 2) {
