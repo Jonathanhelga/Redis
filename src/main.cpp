@@ -227,7 +227,7 @@ int main(int argc, char **argv) {
     // Handle existing clients — stop once we've found every flagged fd.
     for (size_t i = 1; i < fds.size() && n > 0;) {
       if (fds[i].revents == 0) { ++i; continue; }
-      if (blocked_fds.contains(fds[i].fd)) { ++i; continue; }
+      if (blocked_fds.count(fds[i].fd)) { ++i; continue; }
       --n;
       bool drop = false;
       if (fds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
