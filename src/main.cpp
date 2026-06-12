@@ -205,6 +205,12 @@ int main(int argc, char **argv) {
                 list.push_back(args[a]);
               }
               response = ":" + std::to_string(list.size()) + "\r\n";
+            } else if (iequals(args[0], "LPUSH") && args.size() >= 3) {
+              auto &list = lists[args[1]];
+              for (size_t a = 2; a < args.size(); ++a) {
+                list.insert(list.begin(), args[a]);
+              }
+              response = ":" + std::to_string(list.size()) + "\r\n";
             } else if (iequals(args[0], "LRANGE") && args.size() >= 4) {
               long start = std::strtol(args[2].c_str(), nullptr, 10);
               long stop = std::strtol(args[3].c_str(), nullptr, 10);
