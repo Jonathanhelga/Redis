@@ -215,6 +215,15 @@ int main(int argc, char **argv) {
               auto it = lists.find(args[1]);
               long len = (it != lists.end()) ? (long)it->second.size() : 0;
               response = ":" + std::to_string(len) + "\r\n";
+            } else if (iequals(args[0], "LPOP") && args.size() >= 2) {
+              auto it = lists.find(args[1]);
+              if (it != lists.end() && !it->second.empty()) {
+                response = encode_bulk_string(it->second.front());
+                it->second.erase(it->second.begin());
+                if (it->second.empty()) lists.erase(it);  // Redis deletes empty lists
+              } else {
+                response = "$-1\r\n";  // null bulk string: empty or missing list
+              }
             } else if (iequals(args[0], "LRANGE") && args.size() >= 4) {
               long start = std::strtol(args[2].c_str(), nullptr, 10);
               long stop = std::strtol(args[3].c_str(), nullptr, 10);
