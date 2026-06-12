@@ -372,13 +372,93 @@ int main(int argc, char **argv) {
                 response = "+none\r\n";
               }
             } else if (iequals(args[0], "XADD") && args.size() >= 5 && (args.size() % 2) == 1) {
-              StreamEntry entry;
-              entry.id = args[2];
-              for (size_t a = 3; a < args.size(); a += 2) {
-                entry.fields.emplace_back(args[a], args[a + 1]);
+              const std::string &key = args[1];
+              const std::string &id_str = args[2];
+
+              bool auto_ms = false, auto_seq = false;
+              unsigned long long ms = 0, seq = 0;
+              bool parse_ok = true;
+
+              if (id_str == "*") {
+                auto_ms = true;
+                auto_seq = true;
+              } else {
+                auto dash = id_str.find('-');
+                if (dash == std::string::npos) {
+                  parse_ok = false;
+                } else {
+                  std::string ms_part = id_str.substr(0, dash);
+                  std::string seq_part = id_str.substr(dash + 1);
+                  char *end = nullptr;
+                  ms = std::strtoull(ms_part.c_str(), &end, 10);
+                  if (*end != '\0' || ms_part.empty()) parse_ok = false;
+                  if (parse_ok && seq_part == "*") {
+                    auto_seq = true;
+                  } else if (parse_ok) {
+                    end = nullptr;
+                    seq = std::strtoull(seq_part.c_str(), &end, 10);
+                    if (*end != '\0' || seq_part.empty()) parse_ok = false;
+                  }
+                }
               }
-              streams[args[1]].push_back(std::move(entry));
-              response = encode_bulk_string(args[2]);
+
+              if (!parse_ok) {
+                response = "-ERR Invalid stream ID specified\r\n";
+              } else {
+                auto &stream = streams[key];
+                unsigned long long last_ms = 0, last_seq = 0;
+                if (!stream.empty()) {
+                  const std::string &last_id = stream.back().id;
+                  auto d = last_id.find('-');
+                  last_ms = std::strtoull(last_id.substr(0, d).c_str(), nullptr, 10);
+                  last_seq = std::strtoull(last_id.substr(d + 1).c_str(), nullptr, 10);
+                }
+
+                std::string final_id;
+                bool id_valid = true;
+
+                if (auto_ms) {
+                  auto now = static_cast<unsigned long long>(
+                      std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::system_clock::now().time_since_epoch()).count());
+                  if (now > last_ms) {
+                    ms = now;
+                    seq = 0;
+                  } else {
+                    ms = last_ms;
+                    seq = last_seq + 1;
+                  }
+                  final_id = std::to_string(ms) + "-" + std::to_string(seq);
+                } else if (auto_seq) {
+                  if (ms > last_ms) {
+                    seq = 0;
+                  } else if (ms == last_ms) {
+                    seq = last_seq + 1;
+                  } else {
+                    id_valid = false;
+                  }
+                  if (id_valid) {
+                    final_id = std::to_string(ms) + "-" + std::to_string(seq);
+                  }
+                } else {
+                  if (ms < last_ms || (ms == last_ms && seq <= last_seq)) {
+                    id_valid = false;
+                  }
+                  if (id_valid) final_id = id_str;
+                }
+
+                if (!id_valid) {
+                  response = "-ERR The ID specified in XADD is equal or smaller than the previous one\r\n";
+                } else {
+                  StreamEntry entry;
+                  entry.id = final_id;
+                  for (size_t a = 3; a < args.size(); a += 2) {
+                    entry.fields.emplace_back(args[a], args[a + 1]);
+                  }
+                  stream.push_back(std::move(entry));
+                  response = encode_bulk_string(final_id);
+                }
+              }
             } else {
               response = "+PONG\r\n";
             }
