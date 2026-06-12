@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <chrono>
 #include <unistd.h>
 #include <fcntl.h>
@@ -77,6 +78,40 @@ struct Entry {
   Clock::time_point expires_at;
 };
 
+struct BlockedEntry {
+  int fd;
+  std::vector<std::string> keys;
+  Clock::time_point deadline;  // Clock::time_point::max() for indefinite
+};
+
+// After a push to `key`, try to unblock the first blocked client waiting on it.
+static bool try_unblock(
+    const std::string &key,
+    std::unordered_map<std::string, std::vector<std::string>> &lists,
+    std::vector<BlockedEntry> &blocked,
+    std::unordered_set<int> &blocked_fds)
+{
+  auto lit = lists.find(key);
+  if (lit == lists.end() || lit->second.empty()) return false;
+
+  for (auto it = blocked.begin(); it != blocked.end(); ++it) {
+    for (const auto &k : it->keys) {
+      if (k == key && !lit->second.empty()) {
+        std::string value = std::move(lit->second.front());
+        lit->second.erase(lit->second.begin());
+
+        std::string resp = "*2\r\n" + encode_bulk_string(key) + encode_bulk_string(value);
+        send(it->fd, resp.c_str(), resp.size(), 0);
+
+        blocked_fds.erase(it->fd);
+        blocked.erase(it);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 int main(int argc, char **argv) {
   std::cout << std::unitbuf;
   std::cerr << std::unitbuf;
@@ -130,13 +165,43 @@ int main(int argc, char **argv) {
   std::unordered_map<std::string, Entry> store;
   // List store, keyed separately from the string store.
   std::unordered_map<std::string, std::vector<std::string>> lists;
+  std::vector<BlockedEntry> blocked_clients;
+  std::unordered_set<int> blocked_fds;
 
   while (true) {
-    int n = poll(fds.data(), fds.size(), -1);
+    // Compute poll timeout from nearest blocked-client deadline (if any).
+    int poll_timeout = -1;
+    if (!blocked_clients.empty()) {
+      auto now = Clock::now();
+      for (const auto &bc : blocked_clients) {
+        if (bc.deadline == Clock::time_point::max()) continue;
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            bc.deadline - now).count();
+        if (remaining < 0) remaining = 0;
+        if (poll_timeout == -1 || remaining < poll_timeout)
+          poll_timeout = static_cast<int>(remaining);
+      }
+    }
+    int n = poll(fds.data(), fds.size(), poll_timeout);
     if (n < 0) {
       if (errno == EINTR) continue;
       std::cerr << "poll failed\n";
       break;
+    }
+
+    // Expire blocked clients whose deadline has passed.
+    if (!blocked_clients.empty()) {
+      auto now = Clock::now();
+      for (auto it = blocked_clients.begin(); it != blocked_clients.end(); ) {
+        if (it->deadline != Clock::time_point::max() && now >= it->deadline) {
+          std::string resp = "$-1\r\n";
+          send(it->fd, resp.c_str(), resp.size(), 0);
+          blocked_fds.erase(it->fd);
+          it = blocked_clients.erase(it);
+        } else {
+          ++it;
+        }
+      }
     }
     
     // Accept new connections.
@@ -162,6 +227,7 @@ int main(int argc, char **argv) {
     // Handle existing clients — stop once we've found every flagged fd.
     for (size_t i = 1; i < fds.size() && n > 0;) {
       if (fds[i].revents == 0) { ++i; continue; }
+      if (blocked_fds.contains(fds[i].fd)) { ++i; continue; }
       --n;
       bool drop = false;
       if (fds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
@@ -205,12 +271,39 @@ int main(int argc, char **argv) {
                 list.push_back(args[a]);
               }
               response = ":" + std::to_string(list.size()) + "\r\n";
+              try_unblock(args[1], lists, blocked_clients, blocked_fds);
             } else if (iequals(args[0], "LPUSH") && args.size() >= 3) {
               auto &list = lists[args[1]];
               for (size_t a = 2; a < args.size(); ++a) {
                 list.insert(list.begin(), args[a]);
               }
               response = ":" + std::to_string(list.size()) + "\r\n";
+              try_unblock(args[1], lists, blocked_clients, blocked_fds);
+            } else if (iequals(args[0], "BLPOP") && args.size() >= 3) {
+              long timeout_secs = std::strtol(args.back().c_str(), nullptr, 10);
+              bool found = false;
+              for (size_t a = 1; a < args.size() - 1; ++a) {
+                const std::string &key = args[a];
+                auto it = lists.find(key);
+                if (it != lists.end() && !it->second.empty()) {
+                  std::string val = std::move(it->second.front());
+                  it->second.erase(it->second.begin());
+                  if (it->second.empty()) lists.erase(it);
+                  response = "*2\r\n" + encode_bulk_string(key) + encode_bulk_string(val);
+                  found = true;
+                  break;
+                }
+              }
+              if (!found) {
+                std::vector<std::string> keys;
+                for (size_t a = 1; a < args.size() - 1; ++a)
+                  keys.push_back(args[a]);
+                Clock::time_point deadline = Clock::time_point::max();
+                if (timeout_secs > 0)
+                  deadline = Clock::now() + std::chrono::seconds(timeout_secs);
+                blocked_clients.push_back({fds[i].fd, std::move(keys), deadline});
+                blocked_fds.insert(fds[i].fd);
+              }
             } else if (iequals(args[0], "LLEN") && args.size() >= 2) {
               auto it = lists.find(args[1]);
               long len = (it != lists.end()) ? (long)it->second.size() : 0;
@@ -260,13 +353,19 @@ int main(int argc, char **argv) {
           } else {
             response = "+PONG\r\n";
           }
-          send(fds[i].fd, response.c_str(), response.size(), 0);
+          if (!response.empty())
+            send(fds[i].fd, response.c_str(), response.size(), 0);
         }
         else if (bytes_received == 0) { drop = true;}
         else if (errno != EAGAIN && errno != EWOULDBLOCK) { drop = true; }
       }
 
       if (drop) {
+        blocked_fds.erase(fds[i].fd);
+        for (auto bit = blocked_clients.begin(); bit != blocked_clients.end(); ) {
+          if (bit->fd == fds[i].fd) bit = blocked_clients.erase(bit);
+          else ++bit;
+        }
         close(fds[i].fd);
         fds.erase(fds.begin() + i);
       }
