@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <fstream>
+#include <sstream>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -16,6 +17,7 @@
 #include <poll.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 
@@ -90,6 +92,23 @@ static const std::string MASTER_REPLID = "8371b4fb1155b71f4a04d3e1bc3e18c4a990ae
 // RDB persistence config, set from --dir / --dbfilename and reported by CONFIG GET.
 static std::string g_dir = ".";
 static std::string g_dbfilename = "dump.rdb";
+
+// AOF persistence config, set from --appendonly / --appenddirname / --appendfilename /
+// --appendfsync and reported by CONFIG GET.
+static std::string g_appendonly = "no";
+static std::string g_appenddirname = "appendonlydir";
+static std::string g_appendfilename = "appendonly.aof";
+static std::string g_appendfsync = "everysec";
+
+// Resolved path of the active incremental AOF file, set at startup if appendonly is "yes".
+static std::string g_aof_path;
+
+// Appends a RESP-encoded command to the active AOF file, if AOF persistence is enabled.
+static void append_to_aof(const std::vector<std::string> &args) {
+  if (g_aof_path.empty()) return;
+  std::ofstream out(g_aof_path, std::ios::app | std::ios::binary);
+  out << encode_array(args);
+}
 
 // Hex-encoded contents of an empty RDB file, sent to replicas on full resync.
 static const std::string EMPTY_RDB_HEX =
@@ -868,6 +887,14 @@ static std::string execute_command(
                 response = encode_array({args[2], g_dir});
               } else if (iequals(args[2], "dbfilename")) {
                 response = encode_array({args[2], g_dbfilename});
+              } else if (iequals(args[2], "appendonly")) {
+                response = encode_array({args[2], g_appendonly});
+              } else if (iequals(args[2], "appenddirname")) {
+                response = encode_array({args[2], g_appenddirname});
+              } else if (iequals(args[2], "appendfilename")) {
+                response = encode_array({args[2], g_appendfilename});
+              } else if (iequals(args[2], "appendfsync")) {
+                response = encode_array({args[2], g_appendfsync});
               } else {
                 response = "*0\r\n";
               }
@@ -888,6 +915,12 @@ int main(int argc, char **argv) {
   std::cerr << std::unitbuf;
   //flushes the stream after every insertion, without this I might see no output before a crash.
 
+  // Default "dir" to the current working directory, as real Redis does.
+  char cwd_buf[PATH_MAX];
+  if (getcwd(cwd_buf, sizeof(cwd_buf))) {
+    g_dir = cwd_buf;
+  }
+
   int port = 6379;
   bool is_replica = false;
   std::string master_host;
@@ -907,6 +940,14 @@ int main(int argc, char **argv) {
       g_dir = argv[++i];
     } else if (std::strcmp(argv[i], "--dbfilename") == 0 && i + 1 < argc) {
       g_dbfilename = argv[++i];
+    } else if (std::strcmp(argv[i], "--appendonly") == 0 && i + 1 < argc) {
+      g_appendonly = argv[++i];
+    } else if (std::strcmp(argv[i], "--appenddirname") == 0 && i + 1 < argc) {
+      g_appenddirname = argv[++i];
+    } else if (std::strcmp(argv[i], "--appendfilename") == 0 && i + 1 < argc) {
+      g_appendfilename = argv[++i];
+    } else if (std::strcmp(argv[i], "--appendfsync") == 0 && i + 1 < argc) {
+      g_appendfsync = argv[++i];
     }
   }
 
@@ -985,6 +1026,48 @@ int main(int argc, char **argv) {
   std::unordered_map<std::string, unsigned long long> key_versions;
   // Per-connection set of watched keys, with the key version observed at WATCH time.
   std::unordered_map<int, std::unordered_map<std::string, unsigned long long>> watched_keys;
+
+  // AOF persistence setup: create the append-only directory/file/manifest if they
+  // don't exist yet, then replay any previously-logged commands to restore state.
+  if (g_appendonly == "yes") {
+    std::string aof_dir = g_dir + "/" + g_appenddirname;
+    mkdir(aof_dir.c_str(), 0755);
+
+    std::string manifest_path = aof_dir + "/" + g_appendfilename + ".manifest";
+    std::string incr_filename = g_appendfilename + ".1.incr.aof";
+
+    std::ifstream manifest_in(manifest_path);
+    if (manifest_in) {
+      std::string line;
+      while (std::getline(manifest_in, line)) {
+        std::istringstream iss(line);
+        std::vector<std::string> tokens;
+        std::string tok;
+        while (iss >> tok) tokens.push_back(tok);
+        if (tokens.size() >= 6 && tokens[0] == "file" && tokens[4] == "type" && tokens[5] == "i") {
+          incr_filename = tokens[1];
+        }
+      }
+    } else {
+      std::ofstream manifest_out(manifest_path);
+      manifest_out << "file " << incr_filename << " seq 1 type i\n";
+    }
+
+    g_aof_path = aof_dir + "/" + incr_filename;
+    { std::ofstream touch(g_aof_path, std::ios::app); } // ensure the AOF file exists
+
+    std::ifstream aof_in(g_aof_path, std::ios::binary);
+    std::string aof_data((std::istreambuf_iterator<char>(aof_in)), std::istreambuf_iterator<char>());
+    std::vector<std::string> rargs;
+    size_t consumed;
+    while (parse_command(aof_data, rargs, consumed)) {
+      if (!rargs.empty()) {
+        execute_command(rargs, -1, store, lists, streams, blocked_clients, blocked_xreads,
+                         blocked_fds, key_versions, replica_fds, master_repl_offset, is_replica);
+      }
+      aof_data.erase(0, consumed);
+    }
+  }
 
   while (true) {
     // Compute poll timeout from nearest blocked-client deadline (if any).
@@ -1176,10 +1259,13 @@ int main(int argc, char **argv) {
               response = "+QUEUED\r\n";
             } else {
               response = execute_command(args, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions, replica_fds, master_repl_offset, is_replica);
-              if (!replica_fds.empty() && is_write_command(args[0])) {
-                std::string propagated = encode_array(args);
-                for (int rfd : replica_fds) send_all(rfd, propagated);
-                master_repl_offset += propagated.size();
+              if (is_write_command(args[0])) {
+                append_to_aof(args);
+                if (!replica_fds.empty()) {
+                  std::string propagated = encode_array(args);
+                  for (int rfd : replica_fds) send_all(rfd, propagated);
+                  master_repl_offset += propagated.size();
+                }
               }
             }
           } else {
