@@ -91,6 +91,80 @@ struct BlockedEntry {
   Clock::time_point deadline;  // Clock::time_point::max() for indefinite
 };
 
+// A client blocked in XREAD, waiting for new entries on one or more streams.
+struct BlockedXReadEntry {
+  int fd;
+  // (stream key, start ms, start seq) — only entries with an ID greater than this are returned.
+  std::vector<std::tuple<std::string, unsigned long long, unsigned long long>> queries;
+  Clock::time_point deadline;  // Clock::time_point::max() for indefinite
+};
+
+// Build the "*2\r\n<key><entries...>" portion of an XREAD response for each query whose
+// stream has entries with an ID greater than the query's start ID. Returns how many
+// streams had new entries.
+static size_t build_xread_streams(
+    const std::vector<std::tuple<std::string, unsigned long long, unsigned long long>> &queries,
+    const std::unordered_map<std::string, std::vector<StreamEntry>> &streams,
+    std::string &streams_resp)
+{
+  size_t active_streams = 0;
+  for (const auto &[key, start_ms, start_seq] : queries) {
+    auto sit = streams.find(key);
+    if (sit == streams.end()) continue;
+
+    std::string entries_resp;
+    long entry_count = 0;
+    for (const auto &entry : sit->second) {
+      auto ed = entry.id.find('-');
+      unsigned long long e_ms = std::strtoull(entry.id.substr(0, ed).c_str(), nullptr, 10);
+      unsigned long long e_seq = std::strtoull(entry.id.substr(ed + 1).c_str(), nullptr, 10);
+
+      if (e_ms > start_ms || (e_ms == start_ms && e_seq > start_seq)) {
+        std::vector<std::string> fields_resp;
+        for (const auto &fv : entry.fields) {
+          fields_resp.push_back(fv.first);
+          fields_resp.push_back(fv.second);
+        }
+        entries_resp += "*2\r\n" + encode_bulk_string(entry.id) + encode_array(fields_resp);
+        ++entry_count;
+      }
+    }
+
+    if (entry_count > 0) {
+      ++active_streams;
+      streams_resp += "*2\r\n" + encode_bulk_string(key) + "*" + std::to_string(entry_count) + "\r\n" + entries_resp;
+    }
+  }
+  return active_streams;
+}
+
+// After a push to `key`, wake any blocked XREAD clients that now have new entries.
+static void try_unblock_xreads(
+    const std::string &key,
+    std::unordered_map<std::string, std::vector<StreamEntry>> &streams,
+    std::vector<BlockedXReadEntry> &blocked_xreads,
+    std::unordered_set<int> &blocked_fds)
+{
+  for (auto it = blocked_xreads.begin(); it != blocked_xreads.end(); ) {
+    bool waits_on_key = false;
+    for (const auto &q : it->queries) {
+      if (std::get<0>(q) == key) { waits_on_key = true; break; }
+    }
+    if (!waits_on_key) { ++it; continue; }
+
+    std::string streams_resp;
+    size_t active = build_xread_streams(it->queries, streams, streams_resp);
+    if (active > 0) {
+      std::string resp = "*" + std::to_string(active) + "\r\n" + streams_resp;
+      send(it->fd, resp.c_str(), resp.size(), 0);
+      blocked_fds.erase(it->fd);
+      it = blocked_xreads.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 // After a push to `key`, try to unblock the first blocked client waiting on it.
 static bool try_unblock(
     const std::string &key,
@@ -175,17 +249,26 @@ int main(int argc, char **argv) {
   // Stream store, keyed separately from strings and lists.
   std::unordered_map<std::string, std::vector<StreamEntry>> streams;
   std::vector<BlockedEntry> blocked_clients;
+  std::vector<BlockedXReadEntry> blocked_xreads;
   std::unordered_set<int> blocked_fds;
 
   while (true) {
     // Compute poll timeout from nearest blocked-client deadline (if any).
     int poll_timeout = -1;
-    if (!blocked_clients.empty()) {
+    if (!blocked_clients.empty() || !blocked_xreads.empty()) {
       auto now = Clock::now();
       for (const auto &bc : blocked_clients) {
         if (bc.deadline == Clock::time_point::max()) continue;
         auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
             bc.deadline - now).count();
+        if (remaining < 0) remaining = 0;
+        if (poll_timeout == -1 || remaining < poll_timeout)
+          poll_timeout = static_cast<int>(remaining);
+      }
+      for (const auto &bx : blocked_xreads) {
+        if (bx.deadline == Clock::time_point::max()) continue;
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            bx.deadline - now).count();
         if (remaining < 0) remaining = 0;
         if (poll_timeout == -1 || remaining < poll_timeout)
           poll_timeout = static_cast<int>(remaining);
@@ -207,6 +290,21 @@ int main(int argc, char **argv) {
           send(it->fd, resp.c_str(), resp.size(), 0);
           blocked_fds.erase(it->fd);
           it = blocked_clients.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+
+    // Expire blocked XREADs whose deadline has passed.
+    if (!blocked_xreads.empty()) {
+      auto now = Clock::now();
+      for (auto it = blocked_xreads.begin(); it != blocked_xreads.end(); ) {
+        if (it->deadline != Clock::time_point::max() && now >= it->deadline) {
+          std::string resp = "*-1\r\n";
+          send(it->fd, resp.c_str(), resp.size(), 0);
+          blocked_fds.erase(it->fd);
+          it = blocked_xreads.erase(it);
         } else {
           ++it;
         }
@@ -463,6 +561,7 @@ int main(int argc, char **argv) {
                   }
                   streams[key].push_back(std::move(entry));
                   response = encode_bulk_string(final_id);
+                  try_unblock_xreads(key, streams, blocked_xreads, blocked_fds);
                 }
               }
             } else if (iequals(args[0], "XRANGE") && args.size() >= 4) {
@@ -519,59 +618,72 @@ int main(int argc, char **argv) {
                 }
               }
               response = "*" + std::to_string(entry_count) + "\r\n" + entries_resp;
-            } else if (iequals(args[0], "XREAD") && args.size() >= 4 && iequals(args[1], "STREAMS") && (args.size() - 2) % 2 == 0) {
-              size_t num_streams = (args.size() - 2) / 2;
-
-              std::string streams_resp;
-              size_t active_streams = 0;
-              bool xread_error = false;
-
-              for (size_t s = 0; s < num_streams; ++s) {
-                const std::string &key = args[2 + s];
-                const std::string &id_str = args[2 + num_streams + s];
-
-                auto dash = id_str.find('-');
-                if (dash == std::string::npos) {
-                  response = "-ERR Invalid stream ID specified\r\n";
-                  xread_error = true;
-                  break;
-                }
-                unsigned long long start_ms = std::strtoull(id_str.substr(0, dash).c_str(), nullptr, 10);
-                unsigned long long start_seq = std::strtoull(id_str.substr(dash + 1).c_str(), nullptr, 10);
-
-                auto sit = streams.find(key);
-                if (sit == streams.end()) continue;
-
-                std::string entries_resp;
-                long entry_count = 0;
-                for (const auto &entry : sit->second) {
-                  auto ed = entry.id.find('-');
-                  unsigned long long e_ms = std::strtoull(entry.id.substr(0, ed).c_str(), nullptr, 10);
-                  unsigned long long e_seq = std::strtoull(entry.id.substr(ed + 1).c_str(), nullptr, 10);
-
-                  if (e_ms > start_ms || (e_ms == start_ms && e_seq > start_seq)) {
-                    std::vector<std::string> fields_resp;
-                    for (const auto &fv : entry.fields) {
-                      fields_resp.push_back(fv.first);
-                      fields_resp.push_back(fv.second);
-                    }
-                    entries_resp += "*2\r\n" + encode_bulk_string(entry.id) + encode_array(fields_resp);
-                    ++entry_count;
-                  }
-                }
-
-                if (entry_count > 0) {
-                  ++active_streams;
-                  streams_resp += "*2\r\n" + encode_bulk_string(key) + "*" + std::to_string(entry_count) + "\r\n" + entries_resp;
-                }
+            } else if (iequals(args[0], "XREAD") && args.size() >= 4) {
+              size_t idx = 1;
+              bool has_block = false;
+              long block_ms = 0;
+              if (iequals(args[idx], "BLOCK") && idx + 1 < args.size()) {
+                has_block = true;
+                block_ms = std::strtol(args[idx + 1].c_str(), nullptr, 10);
+                idx += 2;
               }
 
-              if (!xread_error) {
-                if (active_streams > 0) {
-                  response = "*" + std::to_string(active_streams) + "\r\n" + streams_resp;
-                } else {
-                  response = "*-1\r\n";
+              if (idx + 1 < args.size() && iequals(args[idx], "STREAMS") &&
+                  (args.size() - idx - 1) % 2 == 0) {
+                size_t num_streams = (args.size() - idx - 1) / 2;
+
+                std::vector<std::tuple<std::string, unsigned long long, unsigned long long>> queries;
+                bool xread_error = false;
+
+                for (size_t s = 0; s < num_streams; ++s) {
+                  const std::string &key = args[idx + 1 + s];
+                  const std::string &id_str = args[idx + 1 + num_streams + s];
+
+                  unsigned long long start_ms, start_seq;
+                  if (id_str == "$") {
+                    // "$" means "the last ID currently in the stream" — resolved now,
+                    // so only entries added after this command will be returned.
+                    auto sit = streams.find(key);
+                    if (sit != streams.end() && !sit->second.empty()) {
+                      const std::string &last_id = sit->second.back().id;
+                      auto d = last_id.find('-');
+                      start_ms = std::strtoull(last_id.substr(0, d).c_str(), nullptr, 10);
+                      start_seq = std::strtoull(last_id.substr(d + 1).c_str(), nullptr, 10);
+                    } else {
+                      start_ms = 0;
+                      start_seq = 0;
+                    }
+                  } else {
+                    auto dash = id_str.find('-');
+                    if (dash == std::string::npos) {
+                      response = "-ERR Invalid stream ID specified\r\n";
+                      xread_error = true;
+                      break;
+                    }
+                    start_ms = std::strtoull(id_str.substr(0, dash).c_str(), nullptr, 10);
+                    start_seq = std::strtoull(id_str.substr(dash + 1).c_str(), nullptr, 10);
+                  }
+                  queries.emplace_back(key, start_ms, start_seq);
                 }
+
+                if (!xread_error) {
+                  std::string streams_resp;
+                  size_t active_streams = build_xread_streams(queries, streams, streams_resp);
+
+                  if (active_streams > 0) {
+                    response = "*" + std::to_string(active_streams) + "\r\n" + streams_resp;
+                  } else if (has_block) {
+                    Clock::time_point deadline = (block_ms > 0)
+                        ? Clock::now() + std::chrono::milliseconds(block_ms)
+                        : Clock::time_point::max();
+                    blocked_xreads.push_back({fds[i].fd, std::move(queries), deadline});
+                    blocked_fds.insert(fds[i].fd);
+                  } else {
+                    response = "*-1\r\n";
+                  }
+                }
+              } else {
+                response = "+PONG\r\n";
               }
             } else {
               response = "+PONG\r\n";
@@ -590,6 +702,10 @@ int main(int argc, char **argv) {
         blocked_fds.erase(fds[i].fd);
         for (auto bit = blocked_clients.begin(); bit != blocked_clients.end(); ) {
           if (bit->fd == fds[i].fd) bit = blocked_clients.erase(bit);
+          else ++bit;
+        }
+        for (auto bit = blocked_xreads.begin(); bit != blocked_xreads.end(); ) {
+          if (bit->fd == fds[i].fd) bit = blocked_xreads.erase(bit);
           else ++bit;
         }
         close(fds[i].fd);
