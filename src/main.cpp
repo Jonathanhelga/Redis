@@ -372,6 +372,31 @@ int main(int argc, char **argv) {
               } else {
                 response = "$-1\r\n";  // null bulk string: key not found / expired
               }
+            } else if (iequals(args[0], "INCR") && args.size() >= 2) {
+              auto it = store.find(args[1]);
+              if (it != store.end() && it->second.has_expiry &&
+                  Clock::now() >= it->second.expires_at) {
+                store.erase(it);
+                it = store.end();
+              }
+              if (it != store.end()) {
+                char *end = nullptr;
+                long long val = std::strtoll(it->second.value.c_str(), &end, 10);
+                if (*end != '\0' || it->second.value.empty()) {
+                  response = "-ERR value is not an integer or out of range\r\n";
+                } else if (val == LLONG_MAX) {
+                  response = "-ERR value is not an integer or out of range\r\n";
+                } else {
+                  val += 1;
+                  it->second.value = std::to_string(val);
+                  response = ":" + std::to_string(val) + "\r\n";
+                }
+              } else {
+                Entry entry;
+                entry.value = "1";
+                store[args[1]] = std::move(entry);
+                response = ":1\r\n";
+              }
             } else if (iequals(args[0], "RPUSH") && args.size() >= 3) {
               auto &list = lists[args[1]];  // creates an empty list if absent
               for (size_t a = 2; a < args.size(); ++a) {
