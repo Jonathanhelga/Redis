@@ -3,6 +3,8 @@
 #include <string>
 #include <cstring>
 #include <cerrno>
+#include <cstdint>
+#include <fstream>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -84,6 +86,10 @@ static bool is_write_command(const std::string &cmd) {
 
 // The replication ID this server reports as a master.
 static const std::string MASTER_REPLID = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
+
+// RDB persistence config, set from --dir / --dbfilename and reported by CONFIG GET.
+static std::string g_dir = ".";
+static std::string g_dbfilename = "dump.rdb";
 
 // Hex-encoded contents of an empty RDB file, sent to replicas on full resync.
 static const std::string EMPTY_RDB_HEX =
@@ -179,6 +185,126 @@ struct Entry {
   bool has_expiry = false;
   Clock::time_point expires_at;
 };
+
+// Reads an RDB length-encoding at `pos`. If the encoding is one of the special
+// string types (integer-as-string), sets `is_special` and `special_type` to its
+// low 6 bits (0 = 8-bit int, 1 = 16-bit int, 2 = 32-bit int) and returns 0.
+static unsigned long long rdb_read_length(const std::string &data, size_t &pos, bool &is_special, int &special_type) {
+  is_special = false;
+  unsigned char b0 = (unsigned char)data[pos++];
+  unsigned char top = b0 >> 6;
+  if (top == 0b00) {
+    return b0 & 0x3F;
+  } else if (top == 0b01) {
+    unsigned char b1 = (unsigned char)data[pos++];
+    return ((b0 & 0x3F) << 8) | b1;
+  } else if (top == 0b10) {
+    unsigned long long val = 0;
+    for (int i = 0; i < 4; ++i) {
+      val = (val << 8) | (unsigned char)data[pos++];
+    }
+    return val;
+  } else {
+    is_special = true;
+    special_type = b0 & 0x3F;
+    return 0;
+  }
+}
+
+// Reads an RDB string encoding (length-prefixed bytes, or an integer-as-string).
+static std::string rdb_read_string(const std::string &data, size_t &pos) {
+  bool is_special;
+  int special_type;
+  unsigned long long len = rdb_read_length(data, pos, is_special, special_type);
+  if (is_special) {
+    if (special_type == 0) {
+      int8_t v = (int8_t)(unsigned char)data[pos++];
+      return std::to_string((int)v);
+    } else if (special_type == 1) {
+      uint16_t u = (unsigned char)data[pos] | ((unsigned char)data[pos + 1] << 8);
+      pos += 2;
+      return std::to_string((int16_t)u);
+    } else if (special_type == 2) {
+      uint32_t u = (unsigned char)data[pos] | ((unsigned char)data[pos + 1] << 8) |
+          ((unsigned char)data[pos + 2] << 16) | ((unsigned char)data[pos + 3] << 24);
+      pos += 4;
+      return std::to_string((int32_t)u);
+    }
+    return ""; // LZF-compressed strings are not expected in this challenge.
+  }
+  std::string s = data.substr(pos, len);
+  pos += len;
+  return s;
+}
+
+// Loads string keys (and their expiry, if any) from an RDB file into `store`.
+// If the file doesn't exist, the database is treated as empty.
+static void load_rdb_file(const std::string &path, std::unordered_map<std::string, Entry> &store) {
+  std::ifstream file(path, std::ios::binary);
+  if (!file) return;
+  std::string data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+  if (data.size() < 9 || data.substr(0, 5) != "REDIS") return;
+
+  size_t pos = 9; // skip "REDIS0011" header
+  bool has_expiry = false;
+  unsigned long long expiry_ms = 0;
+
+  while (pos < data.size()) {
+    unsigned char opcode = (unsigned char)data[pos];
+    if (opcode == 0xFF) {
+      break;
+    } else if (opcode == 0xFE) {
+      ++pos;
+      bool is_special;
+      int special_type;
+      rdb_read_length(data, pos, is_special, special_type); // db index
+    } else if (opcode == 0xFB) {
+      ++pos;
+      bool is_special;
+      int special_type;
+      rdb_read_length(data, pos, is_special, special_type); // hash table size
+      rdb_read_length(data, pos, is_special, special_type); // expires table size
+    } else if (opcode == 0xFA) {
+      ++pos;
+      rdb_read_string(data, pos); // aux name
+      rdb_read_string(data, pos); // aux value
+    } else if (opcode == 0xFC) {
+      ++pos;
+      expiry_ms = 0;
+      for (int i = 0; i < 8; ++i) {
+        expiry_ms |= ((unsigned long long)(unsigned char)data[pos++]) << (8 * i);
+      }
+      has_expiry = true;
+    } else if (opcode == 0xFD) {
+      ++pos;
+      unsigned long long expiry_s = 0;
+      for (int i = 0; i < 4; ++i) {
+        expiry_s |= ((unsigned long long)(unsigned char)data[pos++]) << (8 * i);
+      }
+      expiry_ms = expiry_s * 1000;
+      has_expiry = true;
+    } else {
+      unsigned char value_type = opcode;
+      ++pos;
+      std::string key = rdb_read_string(data, pos);
+      if (value_type == 0) {
+        std::string value = rdb_read_string(data, pos);
+        Entry entry;
+        entry.value = value;
+        if (has_expiry) {
+          entry.has_expiry = true;
+          auto target = std::chrono::system_clock::time_point(std::chrono::milliseconds(expiry_ms));
+          entry.expires_at = Clock::now() + (target - std::chrono::system_clock::now());
+        }
+        store[key] = std::move(entry);
+      } else {
+        break; // value types other than string are not used in this challenge.
+      }
+      has_expiry = false;
+      expiry_ms = 0;
+    }
+  }
+}
 
 // A single entry in a stream: an ID plus an ordered list of field-value pairs.
 struct StreamEntry {
@@ -737,6 +863,20 @@ static std::string execute_command(
                 }
                 response = ":" + std::to_string(acked.size()) + "\r\n";
               }
+            } else if (iequals(args[0], "CONFIG") && args.size() >= 3 && iequals(args[1], "GET")) {
+              if (iequals(args[2], "dir")) {
+                response = encode_array({args[2], g_dir});
+              } else if (iequals(args[2], "dbfilename")) {
+                response = encode_array({args[2], g_dbfilename});
+              } else {
+                response = "*0\r\n";
+              }
+            } else if (iequals(args[0], "KEYS") && args.size() >= 2) {
+              std::vector<std::string> keys;
+              for (const auto &[key, entry] : store) {
+                keys.push_back(key);
+              }
+              response = encode_array(keys);
             } else {
               response = "+PONG\r\n";
             }
@@ -763,6 +903,10 @@ int main(int argc, char **argv) {
         master_host = target.substr(0, space);
         master_port = std::atoi(target.substr(space + 1).c_str());
       }
+    } else if (std::strcmp(argv[i], "--dir") == 0 && i + 1 < argc) {
+      g_dir = argv[++i];
+    } else if (std::strcmp(argv[i], "--dbfilename") == 0 && i + 1 < argc) {
+      g_dbfilename = argv[++i];
     }
   }
 
@@ -826,6 +970,7 @@ int main(int argc, char **argv) {
 
   // The key-value store, shared across all clients.
   std::unordered_map<std::string, Entry> store;
+  load_rdb_file(g_dir + "/" + g_dbfilename, store);
   // List store, keyed separately from the string store.
   std::unordered_map<std::string, std::vector<std::string>> lists;
   // Stream store, keyed separately from strings and lists.
