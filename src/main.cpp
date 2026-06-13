@@ -796,6 +796,9 @@ int main(int argc, char **argv) {
                 }
                 response = "+OK\r\n";
               }
+            } else if (iequals(args[0], "UNWATCH")) {
+              watched_keys.erase(fds[i].fd);
+              response = "+OK\r\n";
             } else if (multi_clients.count(fds[i].fd)) {
               queued_commands[fds[i].fd].push_back(args);
               response = "+QUEUED\r\n";
