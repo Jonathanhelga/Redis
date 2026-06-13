@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <chrono>
+#include <climits>
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -464,6 +465,61 @@ int main(int argc, char **argv) {
                   response = encode_bulk_string(final_id);
                 }
               }
+            } else if (iequals(args[0], "XRANGE") && args.size() >= 4) {
+              const std::string &key = args[1];
+              const std::string &start_str = args[2];
+              const std::string &end_str = args[3];
+
+              // Parse an XRANGE bound "<ms>-<seq>" or "<ms>" (seq falls back to default_seq).
+              auto parse_range_id = [](const std::string &s, unsigned long long &ms,
+                                        unsigned long long &seq, unsigned long long default_seq) {
+                auto dash = s.find('-');
+                if (dash == std::string::npos) {
+                  ms = std::strtoull(s.c_str(), nullptr, 10);
+                  seq = default_seq;
+                } else {
+                  ms = std::strtoull(s.substr(0, dash).c_str(), nullptr, 10);
+                  seq = std::strtoull(s.substr(dash + 1).c_str(), nullptr, 10);
+                }
+              };
+
+              unsigned long long start_ms, start_seq, end_ms, end_seq;
+              if (start_str == "-") {
+                start_ms = 0;
+                start_seq = 0;
+              } else {
+                parse_range_id(start_str, start_ms, start_seq, 0);
+              }
+              if (end_str == "+") {
+                end_ms = ULLONG_MAX;
+                end_seq = ULLONG_MAX;
+              } else {
+                parse_range_id(end_str, end_ms, end_seq, ULLONG_MAX);
+              }
+
+              std::string entries_resp;
+              long entry_count = 0;
+              auto sit = streams.find(key);
+              if (sit != streams.end()) {
+                for (const auto &entry : sit->second) {
+                  auto d = entry.id.find('-');
+                  unsigned long long e_ms = std::strtoull(entry.id.substr(0, d).c_str(), nullptr, 10);
+                  unsigned long long e_seq = std::strtoull(entry.id.substr(d + 1).c_str(), nullptr, 10);
+
+                  bool ge_start = (e_ms > start_ms) || (e_ms == start_ms && e_seq >= start_seq);
+                  bool le_end = (e_ms < end_ms) || (e_ms == end_ms && e_seq <= end_seq);
+                  if (ge_start && le_end) {
+                    std::vector<std::string> fields_resp;
+                    for (const auto &fv : entry.fields) {
+                      fields_resp.push_back(fv.first);
+                      fields_resp.push_back(fv.second);
+                    }
+                    entries_resp += "*2\r\n" + encode_bulk_string(entry.id) + encode_array(fields_resp);
+                    ++entry_count;
+                  }
+                }
+              }
+              response = "*" + std::to_string(entry_count) + "\r\n" + entries_resp;
             } else {
               response = "+PONG\r\n";
             }
