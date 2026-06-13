@@ -203,7 +203,8 @@ static std::string execute_command(
     std::vector<BlockedEntry> &blocked_clients,
     std::vector<BlockedXReadEntry> &blocked_xreads,
     std::unordered_set<int> &blocked_fds,
-    std::unordered_map<std::string, unsigned long long> &key_versions)
+    std::unordered_map<std::string, unsigned long long> &key_versions,
+    bool is_replica)
 {
   std::string response;
             if (iequals(args[0], "ECHO") && args.size() >= 2) {
@@ -579,7 +580,8 @@ static std::string execute_command(
                 response = "+PONG\r\n";
               }
             } else if (iequals(args[0], "INFO")) {
-              response = encode_bulk_string("role:master\r\n");
+              std::string role = is_replica ? "slave" : "master";
+              response = encode_bulk_string("role:" + role + "\r\n");
             } else {
               response = "+PONG\r\n";
             }
@@ -592,9 +594,13 @@ int main(int argc, char **argv) {
   //flushes the stream after every insertion, without this I might see no output before a crash.
 
   int port = 6379;
+  bool is_replica = false;
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
       port = std::atoi(argv[++i]);
+    } else if (std::strcmp(argv[i], "--replicaof") == 0 && i + 1 < argc) {
+      is_replica = true;
+      ++i;
     }
   }
 
@@ -783,7 +789,7 @@ int main(int argc, char **argv) {
                 } else {
                   std::string results;
                   for (auto &cmd : cmds) {
-                    results += execute_command(cmd, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions);
+                    results += execute_command(cmd, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions, is_replica);
                   }
                   response = "*" + std::to_string(cmds.size()) + "\r\n" + results;
                 }
@@ -813,7 +819,7 @@ int main(int argc, char **argv) {
               queued_commands[fds[i].fd].push_back(args);
               response = "+QUEUED\r\n";
             } else {
-              response = execute_command(args, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions);
+              response = execute_command(args, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions, is_replica);
             }
           } else {
             response = "+PONG\r\n";
