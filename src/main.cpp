@@ -589,6 +589,13 @@ int main(int argc, char **argv) {
   std::cerr << std::unitbuf;
   //flushes the stream after every insertion, without this I might see no output before a crash.
 
+  int port = 6379;
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+      port = std::atoi(argv[++i]);
+    }
+  }
+
   int server_fd = socket(AF_INET, SOCK_STREAM, 0);
   //socket(domain, type, protocol) returns a new socket fd (file descriptor), or -1 on error. is like calling the phone company and saying "I want a phone", they give me back a number
   // server_fd is what we refer to that phone from now
@@ -610,10 +617,10 @@ int main(int argc, char **argv) {
   struct sockaddr_in server_addr;
   server_addr.sin_family = AF_INET;
   server_addr.sin_addr.s_addr = INADDR_ANY;
-  server_addr.sin_port = htons(6379);
+  server_addr.sin_port = htons(port);
 
   if (bind(server_fd, (struct sockaddr *) &server_addr, sizeof(server_addr)) != 0) {
-    std::cerr << "Failed to bind to port 6379\n";
+    std::cerr << "Failed to bind to port " << port << "\n";
     return 1;
   }
 
