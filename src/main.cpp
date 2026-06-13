@@ -788,10 +788,14 @@ int main(int argc, char **argv) {
                 response = "+OK\r\n";
               }
             } else if (iequals(args[0], "WATCH") && args.size() >= 2) {
-              for (size_t a = 1; a < args.size(); ++a) {
-                watched_keys[fds[i].fd][args[a]] = key_versions[args[a]];
+              if (multi_clients.count(fds[i].fd)) {
+                response = "-ERR WATCH inside MULTI is not allowed\r\n";
+              } else {
+                for (size_t a = 1; a < args.size(); ++a) {
+                  watched_keys[fds[i].fd][args[a]] = key_versions[args[a]];
+                }
+                response = "+OK\r\n";
               }
-              response = "+OK\r\n";
             } else if (multi_clients.count(fds[i].fd)) {
               queued_commands[fds[i].fd].push_back(args);
               response = "+QUEUED\r\n";
