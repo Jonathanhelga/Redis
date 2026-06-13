@@ -251,6 +251,9 @@ int main(int argc, char **argv) {
   std::vector<BlockedEntry> blocked_clients;
   std::vector<BlockedXReadEntry> blocked_xreads;
   std::unordered_set<int> blocked_fds;
+  // Connections that have issued MULTI and are queuing commands until EXEC/DISCARD.
+  std::unordered_set<int> multi_clients;
+  std::unordered_map<int, std::vector<std::vector<std::string>>> queued_commands;
 
   while (true) {
     // Compute poll timeout from nearest blocked-client deadline (if any).
@@ -347,7 +350,17 @@ int main(int argc, char **argv) {
           std::vector<std::string> args;
           std::string response;
           if (parse_command(input, args) && !args.empty()) {
-            if (iequals(args[0], "ECHO") && args.size() >= 2) {
+            if (iequals(args[0], "MULTI")) {
+              if (!multi_clients.insert(fds[i].fd).second) {
+                response = "-ERR MULTI calls can not be nested\r\n";
+              } else {
+                queued_commands[fds[i].fd].clear();
+                response = "+OK\r\n";
+              }
+            } else if (multi_clients.count(fds[i].fd)) {
+              queued_commands[fds[i].fd].push_back(args);
+              response = "+QUEUED\r\n";
+            } else if (iequals(args[0], "ECHO") && args.size() >= 2) {
               response = encode_bulk_string(args[1]);
             } else if (iequals(args[0], "SET") && args.size() >= 3) {
               Entry entry;
@@ -733,6 +746,8 @@ int main(int argc, char **argv) {
           if (bit->fd == fds[i].fd) bit = blocked_xreads.erase(bit);
           else ++bit;
         }
+        multi_clients.erase(fds[i].fd);
+        queued_commands.erase(fds[i].fd);
         close(fds[i].fd);
         fds.erase(fds.begin() + i);
       }
