@@ -193,174 +193,19 @@ static bool try_unblock(
   return false;
 }
 
-int main(int argc, char **argv) {
-  std::cout << std::unitbuf;
-  std::cerr << std::unitbuf;
-  //flushes the stream after every insertion, without this I might see no output before a crash.
-
-  int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-  //socket(domain, type, protocol) returns a new socket fd (file descriptor), or -1 on error. is like calling the phone company and saying "I want a phone", they give me back a number
-  // server_fd is what we refer to that phone from now
-  //AF_INET = IPv4 address family
-  //SOCK_STREAM =  a reliable, ordered byte stream → TCP.
-  //0 = let the kernel pick the default protocol for that family/type (TCP for AF_INET+SOCK_STREAM).
-  if (server_fd < 0) {
-    std::cerr << "Failed to create server socket\n";
-    return 1;
-  }
-
-  int reuse = 1;
-  if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
-  // setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) it allows rebind to the port quickly after restarts(avoids "Address already in use")
-    std::cerr << "setsockopt failed\n";                     
-    return 1;
-  }
-
-  struct sockaddr_in server_addr;
-  server_addr.sin_family = AF_INET;
-  server_addr.sin_addr.s_addr = INADDR_ANY;
-  server_addr.sin_port = htons(6379);
-
-  if (bind(server_fd, (struct sockaddr *) &server_addr, sizeof(server_addr)) != 0) {
-    std::cerr << "Failed to bind to port 6379\n";
-    return 1;
-  }
-
-  int connection_backlog = 5;
-  if (listen(server_fd, connection_backlog) != 0) {
-    std::cerr << "listen failed\n";
-    return 1;
-  }
-
-  if (!set_nonblocking(server_fd)) {
-    std::cerr << "Failed to set listener non-blocking\n";
-    return 1;
-  }
-
-  std::cout << "Waiting for clients to connect...\n";
-
-  std::vector<pollfd> fds;
-  fds.push_back({server_fd, POLLIN, 0});
-
-  // The key-value store, shared across all clients.
-  std::unordered_map<std::string, Entry> store;
-  // List store, keyed separately from the string store.
-  std::unordered_map<std::string, std::vector<std::string>> lists;
-  // Stream store, keyed separately from strings and lists.
-  std::unordered_map<std::string, std::vector<StreamEntry>> streams;
-  std::vector<BlockedEntry> blocked_clients;
-  std::vector<BlockedXReadEntry> blocked_xreads;
-  std::unordered_set<int> blocked_fds;
-  // Connections that have issued MULTI and are queuing commands until EXEC/DISCARD.
-  std::unordered_set<int> multi_clients;
-  std::unordered_map<int, std::vector<std::vector<std::string>>> queued_commands;
-
-  while (true) {
-    // Compute poll timeout from nearest blocked-client deadline (if any).
-    int poll_timeout = -1;
-    if (!blocked_clients.empty() || !blocked_xreads.empty()) {
-      auto now = Clock::now();
-      for (const auto &bc : blocked_clients) {
-        if (bc.deadline == Clock::time_point::max()) continue;
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-            bc.deadline - now).count();
-        if (remaining < 0) remaining = 0;
-        if (poll_timeout == -1 || remaining < poll_timeout)
-          poll_timeout = static_cast<int>(remaining);
-      }
-      for (const auto &bx : blocked_xreads) {
-        if (bx.deadline == Clock::time_point::max()) continue;
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-            bx.deadline - now).count();
-        if (remaining < 0) remaining = 0;
-        if (poll_timeout == -1 || remaining < poll_timeout)
-          poll_timeout = static_cast<int>(remaining);
-      }
-    }
-    int n = poll(fds.data(), fds.size(), poll_timeout);
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      std::cerr << "poll failed\n";
-      break;
-    }
-
-    // Expire blocked clients whose deadline has passed.
-    if (!blocked_clients.empty()) {
-      auto now = Clock::now();
-      for (auto it = blocked_clients.begin(); it != blocked_clients.end(); ) {
-        if (it->deadline != Clock::time_point::max() && now >= it->deadline) {
-          std::string resp = "*-1\r\n";
-          send(it->fd, resp.c_str(), resp.size(), 0);
-          blocked_fds.erase(it->fd);
-          it = blocked_clients.erase(it);
-        } else {
-          ++it;
-        }
-      }
-    }
-
-    // Expire blocked XREADs whose deadline has passed.
-    if (!blocked_xreads.empty()) {
-      auto now = Clock::now();
-      for (auto it = blocked_xreads.begin(); it != blocked_xreads.end(); ) {
-        if (it->deadline != Clock::time_point::max() && now >= it->deadline) {
-          std::string resp = "*-1\r\n";
-          send(it->fd, resp.c_str(), resp.size(), 0);
-          blocked_fds.erase(it->fd);
-          it = blocked_xreads.erase(it);
-        } else {
-          ++it;
-        }
-      }
-    }
-    
-    // Accept new connections.
-    if (fds[0].revents != 0) {
-      --n;
-      if (fds[0].revents & POLLIN) {
-        while (true) {
-          struct sockaddr_in client_addr;
-          socklen_t client_addr_len = sizeof(client_addr);
-          int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
-          if (client_fd < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-            std::cerr << "accept failed\n";
-            break;
-          }
-          set_nonblocking(client_fd);
-          fds.push_back({client_fd, POLLIN, 0});
-          std::cout << "Client connected (fd=" << client_fd << ")\n";
-        }
-      }
-    }
-
-    // Handle existing clients — stop once we've found every flagged fd.
-    for (size_t i = 1; i < fds.size() && n > 0;) {
-      if (fds[i].revents == 0) { ++i; continue; }
-      if (blocked_fds.count(fds[i].fd)) { ++i; continue; }
-      --n;
-      bool drop = false;
-      if (fds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-        drop = true;
-      } else if (fds[i].revents & POLLIN) {
-        char buffer[1024];
-        int bytes_received = recv(fds[i].fd, buffer, sizeof(buffer), 0);
-        if (bytes_received > 0) {
-          std::string input(buffer, bytes_received);
-          std::vector<std::string> args;
-          std::string response;
-          if (parse_command(input, args) && !args.empty()) {
-            if (iequals(args[0], "MULTI")) {
-              if (!multi_clients.insert(fds[i].fd).second) {
-                response = "-ERR MULTI calls can not be nested\r\n";
-              } else {
-                queued_commands[fds[i].fd].clear();
-                response = "+OK\r\n";
-              }
-            } else if (multi_clients.count(fds[i].fd)) {
-              queued_commands[fds[i].fd].push_back(args);
-              response = "+QUEUED\r\n";
-            } else if (iequals(args[0], "ECHO") && args.size() >= 2) {
+// Executes a single command (used both for direct dispatch and for commands queued via MULTI/EXEC).
+static std::string execute_command(
+    const std::vector<std::string> &args,
+    int fd,
+    std::unordered_map<std::string, Entry> &store,
+    std::unordered_map<std::string, std::vector<std::string>> &lists,
+    std::unordered_map<std::string, std::vector<StreamEntry>> &streams,
+    std::vector<BlockedEntry> &blocked_clients,
+    std::vector<BlockedXReadEntry> &blocked_xreads,
+    std::unordered_set<int> &blocked_fds)
+{
+  std::string response;
+            if (iequals(args[0], "ECHO") && args.size() >= 2) {
               response = encode_bulk_string(args[1]);
             } else if (iequals(args[0], "SET") && args.size() >= 3) {
               Entry entry;
@@ -446,8 +291,8 @@ int main(int argc, char **argv) {
                 Clock::time_point deadline = Clock::time_point::max();
                 if (timeout_secs > 0)
                   deadline = Clock::now() + std::chrono::milliseconds(static_cast<long>(timeout_secs * 1000));
-                blocked_clients.push_back({fds[i].fd, std::move(keys), deadline});
-                blocked_fds.insert(fds[i].fd);
+                blocked_clients.push_back({fd, std::move(keys), deadline});
+                blocked_fds.insert(fd);
               }
             } else if (iequals(args[0], "LLEN") && args.size() >= 2) {
               auto it = lists.find(args[1]);
@@ -714,8 +559,8 @@ int main(int argc, char **argv) {
                     Clock::time_point deadline = (block_ms > 0)
                         ? Clock::now() + std::chrono::milliseconds(block_ms)
                         : Clock::time_point::max();
-                    blocked_xreads.push_back({fds[i].fd, std::move(queries), deadline});
-                    blocked_fds.insert(fds[i].fd);
+                    blocked_xreads.push_back({fd, std::move(queries), deadline});
+                    blocked_fds.insert(fd);
                   } else {
                     response = "*-1\r\n";
                   }
@@ -725,6 +570,192 @@ int main(int argc, char **argv) {
               }
             } else {
               response = "+PONG\r\n";
+            }
+  return response;
+}
+
+int main(int argc, char **argv) {
+  std::cout << std::unitbuf;
+  std::cerr << std::unitbuf;
+  //flushes the stream after every insertion, without this I might see no output before a crash.
+
+  int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+  //socket(domain, type, protocol) returns a new socket fd (file descriptor), or -1 on error. is like calling the phone company and saying "I want a phone", they give me back a number
+  // server_fd is what we refer to that phone from now
+  //AF_INET = IPv4 address family
+  //SOCK_STREAM =  a reliable, ordered byte stream → TCP.
+  //0 = let the kernel pick the default protocol for that family/type (TCP for AF_INET+SOCK_STREAM).
+  if (server_fd < 0) {
+    std::cerr << "Failed to create server socket\n";
+    return 1;
+  }
+
+  int reuse = 1;
+  if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+  // setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) it allows rebind to the port quickly after restarts(avoids "Address already in use")
+    std::cerr << "setsockopt failed\n";                     
+    return 1;
+  }
+
+  struct sockaddr_in server_addr;
+  server_addr.sin_family = AF_INET;
+  server_addr.sin_addr.s_addr = INADDR_ANY;
+  server_addr.sin_port = htons(6379);
+
+  if (bind(server_fd, (struct sockaddr *) &server_addr, sizeof(server_addr)) != 0) {
+    std::cerr << "Failed to bind to port 6379\n";
+    return 1;
+  }
+
+  int connection_backlog = 5;
+  if (listen(server_fd, connection_backlog) != 0) {
+    std::cerr << "listen failed\n";
+    return 1;
+  }
+
+  if (!set_nonblocking(server_fd)) {
+    std::cerr << "Failed to set listener non-blocking\n";
+    return 1;
+  }
+
+  std::cout << "Waiting for clients to connect...\n";
+
+  std::vector<pollfd> fds;
+  fds.push_back({server_fd, POLLIN, 0});
+
+  // The key-value store, shared across all clients.
+  std::unordered_map<std::string, Entry> store;
+  // List store, keyed separately from the string store.
+  std::unordered_map<std::string, std::vector<std::string>> lists;
+  // Stream store, keyed separately from strings and lists.
+  std::unordered_map<std::string, std::vector<StreamEntry>> streams;
+  std::vector<BlockedEntry> blocked_clients;
+  std::vector<BlockedXReadEntry> blocked_xreads;
+  std::unordered_set<int> blocked_fds;
+  // Connections that have issued MULTI and are queuing commands until EXEC/DISCARD.
+  std::unordered_set<int> multi_clients;
+  std::unordered_map<int, std::vector<std::vector<std::string>>> queued_commands;
+
+  while (true) {
+    // Compute poll timeout from nearest blocked-client deadline (if any).
+    int poll_timeout = -1;
+    if (!blocked_clients.empty() || !blocked_xreads.empty()) {
+      auto now = Clock::now();
+      for (const auto &bc : blocked_clients) {
+        if (bc.deadline == Clock::time_point::max()) continue;
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            bc.deadline - now).count();
+        if (remaining < 0) remaining = 0;
+        if (poll_timeout == -1 || remaining < poll_timeout)
+          poll_timeout = static_cast<int>(remaining);
+      }
+      for (const auto &bx : blocked_xreads) {
+        if (bx.deadline == Clock::time_point::max()) continue;
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            bx.deadline - now).count();
+        if (remaining < 0) remaining = 0;
+        if (poll_timeout == -1 || remaining < poll_timeout)
+          poll_timeout = static_cast<int>(remaining);
+      }
+    }
+    int n = poll(fds.data(), fds.size(), poll_timeout);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      std::cerr << "poll failed\n";
+      break;
+    }
+
+    // Expire blocked clients whose deadline has passed.
+    if (!blocked_clients.empty()) {
+      auto now = Clock::now();
+      for (auto it = blocked_clients.begin(); it != blocked_clients.end(); ) {
+        if (it->deadline != Clock::time_point::max() && now >= it->deadline) {
+          std::string resp = "*-1\r\n";
+          send(it->fd, resp.c_str(), resp.size(), 0);
+          blocked_fds.erase(it->fd);
+          it = blocked_clients.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+
+    // Expire blocked XREADs whose deadline has passed.
+    if (!blocked_xreads.empty()) {
+      auto now = Clock::now();
+      for (auto it = blocked_xreads.begin(); it != blocked_xreads.end(); ) {
+        if (it->deadline != Clock::time_point::max() && now >= it->deadline) {
+          std::string resp = "*-1\r\n";
+          send(it->fd, resp.c_str(), resp.size(), 0);
+          blocked_fds.erase(it->fd);
+          it = blocked_xreads.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+    
+    // Accept new connections.
+    if (fds[0].revents != 0) {
+      --n;
+      if (fds[0].revents & POLLIN) {
+        while (true) {
+          struct sockaddr_in client_addr;
+          socklen_t client_addr_len = sizeof(client_addr);
+          int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
+          if (client_fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            std::cerr << "accept failed\n";
+            break;
+          }
+          set_nonblocking(client_fd);
+          fds.push_back({client_fd, POLLIN, 0});
+          std::cout << "Client connected (fd=" << client_fd << ")\n";
+        }
+      }
+    }
+
+    // Handle existing clients — stop once we've found every flagged fd.
+    for (size_t i = 1; i < fds.size() && n > 0;) {
+      if (fds[i].revents == 0) { ++i; continue; }
+      if (blocked_fds.count(fds[i].fd)) { ++i; continue; }
+      --n;
+      bool drop = false;
+      if (fds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        drop = true;
+      } else if (fds[i].revents & POLLIN) {
+        char buffer[1024];
+        int bytes_received = recv(fds[i].fd, buffer, sizeof(buffer), 0);
+        if (bytes_received > 0) {
+          std::string input(buffer, bytes_received);
+          std::vector<std::string> args;
+          std::string response;
+          if (parse_command(input, args) && !args.empty()) {
+            if (iequals(args[0], "MULTI")) {
+              if (!multi_clients.insert(fds[i].fd).second) {
+                response = "-ERR MULTI calls can not be nested\r\n";
+              } else {
+                queued_commands[fds[i].fd].clear();
+                response = "+OK\r\n";
+              }
+            } else if (iequals(args[0], "EXEC")) {
+              if (!multi_clients.count(fds[i].fd)) {
+                response = "-ERR EXEC without MULTI\r\n";
+              } else {
+                auto cmds = std::move(queued_commands[fds[i].fd]);
+                multi_clients.erase(fds[i].fd);
+                queued_commands.erase(fds[i].fd);
+                std::string results;
+                for (auto &cmd : cmds) {
+                  results += execute_command(cmd, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds);
+                }
+                response = "*" + std::to_string(cmds.size()) + "\r\n" + results;
+              }
+            } else if (multi_clients.count(fds[i].fd)) {
+              queued_commands[fds[i].fd].push_back(args);
+              response = "+QUEUED\r\n";
+            } else {
+              response = execute_command(args, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds);
             }
           } else {
             response = "+PONG\r\n";
