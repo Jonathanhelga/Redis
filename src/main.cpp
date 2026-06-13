@@ -1,4 +1,5 @@
 #include <iostream>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <cstring>
@@ -78,9 +79,27 @@ static bool iequals(const std::string &a, const char *b) {
   return strcasecmp(a.c_str(), b) == 0;
 }
 
+// Formats a sorted-set score the way Redis does: integral values are printed
+// without a decimal point, otherwise the shortest decimal that round-trips.
+static std::string format_score(double score) {
+  if (score == (double)(long long)score) {
+    return std::to_string((long long)score);
+  }
+  for (int prec = 1; prec <= 17; ++prec) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.*f", prec, score);
+    if (std::strtod(buf, nullptr) == score) {
+      return std::string(buf);
+    }
+  }
+  char buf[64];
+  snprintf(buf, sizeof(buf), "%.17f", score);
+  return std::string(buf);
+}
+
 // Commands that mutate the dataset and must be propagated to connected replicas.
 static bool is_write_command(const std::string &cmd) {
-  static const char *writes[] = {"SET", "INCR", "RPUSH", "LPUSH", "LPOP", "XADD"};
+  static const char *writes[] = {"SET", "INCR", "RPUSH", "LPUSH", "LPOP", "XADD", "ZADD", "ZREM"};
   for (const char *w : writes) {
     if (iequals(cmd, w)) return true;
   }
@@ -454,7 +473,8 @@ static std::string execute_command(
     std::vector<int> &replica_fds,
     long long &master_repl_offset,
     bool is_replica,
-    std::unordered_map<int, std::unordered_set<std::string>> &subscriptions)
+    std::unordered_map<int, std::unordered_set<std::string>> &subscriptions,
+    std::unordered_map<std::string, std::vector<std::pair<double, std::string>>> &sorted_sets)
 {
   std::string response;
   bool in_subscribed_mode = subscriptions.count(fd) && !subscriptions.at(fd).empty();
@@ -940,6 +960,86 @@ static std::string execute_command(
                 }
               }
               response = ":" + std::to_string(count) + "\r\n";
+            } else if (iequals(args[0], "ZADD") && args.size() >= 4) {
+              double score = std::strtod(args[2].c_str(), nullptr);
+              const std::string &member = args[3];
+              auto &zset = sorted_sets[args[1]];
+              auto it = std::find_if(zset.begin(), zset.end(),
+                  [&](const auto &p) { return p.second == member; });
+              int added = 0;
+              if (it != zset.end()) {
+                zset.erase(it);
+              } else {
+                added = 1;
+              }
+              auto pos = std::lower_bound(zset.begin(), zset.end(), std::make_pair(score, member),
+                  [](const auto &a, const auto &b) {
+                    if (a.first != b.first) return a.first < b.first;
+                    return a.second < b.second;
+                  });
+              zset.insert(pos, {score, member});
+              response = ":" + std::to_string(added) + "\r\n";
+            } else if (iequals(args[0], "ZRANK") && args.size() >= 3) {
+              auto sit = sorted_sets.find(args[1]);
+              if (sit == sorted_sets.end()) {
+                response = "$-1\r\n";
+              } else {
+                auto &zset = sit->second;
+                auto it = std::find_if(zset.begin(), zset.end(),
+                    [&](const auto &p) { return p.second == args[2]; });
+                if (it == zset.end()) {
+                  response = "$-1\r\n";
+                } else {
+                  response = ":" + std::to_string(it - zset.begin()) + "\r\n";
+                }
+              }
+            } else if (iequals(args[0], "ZRANGE") && args.size() >= 4) {
+              auto sit = sorted_sets.find(args[1]);
+              if (sit == sorted_sets.end()) {
+                response = "*0\r\n";
+              } else {
+                auto &zset = sit->second;
+                long size = (long)zset.size();
+                long start = std::strtol(args[2].c_str(), nullptr, 10);
+                long stop = std::strtol(args[3].c_str(), nullptr, 10);
+                if (start < 0) start = std::max(0L, size + start);
+                if (stop < 0) stop = std::max(0L, size + stop);
+                if (stop >= size) stop = size - 1;
+                if (start >= size || start > stop) {
+                  response = "*0\r\n";
+                } else {
+                  std::vector<std::string> members;
+                  for (long idx = start; idx <= stop; ++idx) members.push_back(zset[idx].second);
+                  response = encode_array(members);
+                }
+              }
+            } else if (iequals(args[0], "ZCARD") && args.size() >= 2) {
+              auto sit = sorted_sets.find(args[1]);
+              long count = (sit == sorted_sets.end()) ? 0 : (long)sit->second.size();
+              response = ":" + std::to_string(count) + "\r\n";
+            } else if (iequals(args[0], "ZSCORE") && args.size() >= 3) {
+              auto sit = sorted_sets.find(args[1]);
+              if (sit == sorted_sets.end()) {
+                response = "$-1\r\n";
+              } else {
+                auto &zset = sit->second;
+                auto it = std::find_if(zset.begin(), zset.end(),
+                    [&](const auto &p) { return p.second == args[2]; });
+                response = (it == zset.end()) ? "$-1\r\n" : encode_bulk_string(format_score(it->first));
+              }
+            } else if (iequals(args[0], "ZREM") && args.size() >= 3) {
+              auto sit = sorted_sets.find(args[1]);
+              int removed = 0;
+              if (sit != sorted_sets.end()) {
+                auto &zset = sit->second;
+                auto it = std::find_if(zset.begin(), zset.end(),
+                    [&](const auto &p) { return p.second == args[2]; });
+                if (it != zset.end()) {
+                  zset.erase(it);
+                  removed = 1;
+                }
+              }
+              response = ":" + std::to_string(removed) + "\r\n";
             } else {
               response = "+PONG\r\n";
             }
@@ -1052,6 +1152,8 @@ int main(int argc, char **argv) {
   std::unordered_map<std::string, std::vector<std::string>> lists;
   // Stream store, keyed separately from strings and lists.
   std::unordered_map<std::string, std::vector<StreamEntry>> streams;
+  // Sorted-set store: each vector is kept sorted by (score, member).
+  std::unordered_map<std::string, std::vector<std::pair<double, std::string>>> sorted_sets;
   std::vector<BlockedEntry> blocked_clients;
   std::vector<BlockedXReadEntry> blocked_xreads;
   std::unordered_set<int> blocked_fds;
@@ -1101,7 +1203,7 @@ int main(int argc, char **argv) {
     while (parse_command(aof_data, rargs, consumed)) {
       if (!rargs.empty()) {
         execute_command(rargs, -1, store, lists, streams, blocked_clients, blocked_xreads,
-                         blocked_fds, key_versions, replica_fds, master_repl_offset, is_replica, subscriptions);
+                         blocked_fds, key_versions, replica_fds, master_repl_offset, is_replica, subscriptions, sorted_sets);
       }
       aof_data.erase(0, consumed);
     }
@@ -1207,7 +1309,7 @@ int main(int argc, char **argv) {
                 std::string ack = encode_array({"REPLCONF", "ACK", std::to_string(replica_offset)});
                 send_all(fds[i].fd, ack);
               } else {
-                execute_command(margs, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions, replica_fds, master_repl_offset, is_replica, subscriptions);
+                execute_command(margs, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions, replica_fds, master_repl_offset, is_replica, subscriptions, sorted_sets);
               }
               replica_offset += consumed;
             }
@@ -1266,7 +1368,7 @@ int main(int argc, char **argv) {
                 } else {
                   std::string results;
                   for (auto &cmd : cmds) {
-                    results += execute_command(cmd, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions, replica_fds, master_repl_offset, is_replica, subscriptions);
+                    results += execute_command(cmd, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions, replica_fds, master_repl_offset, is_replica, subscriptions, sorted_sets);
                   }
                   response = "*" + std::to_string(cmds.size()) + "\r\n" + results;
                 }
@@ -1296,7 +1398,7 @@ int main(int argc, char **argv) {
               queued_commands[fds[i].fd].push_back(args);
               response = "+QUEUED\r\n";
             } else {
-              response = execute_command(args, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions, replica_fds, master_repl_offset, is_replica, subscriptions);
+              response = execute_command(args, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions, replica_fds, master_repl_offset, is_replica, subscriptions, sorted_sets);
               if (is_write_command(args[0])) {
                 append_to_aof(args);
                 if (!replica_fds.empty()) {
