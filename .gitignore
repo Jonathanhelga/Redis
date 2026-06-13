@@ -1049,3 +1049,4 @@ vcpkg_installed
 # OpenCode
 .opencode/
 AGENTS.md
+prompt.txt
