@@ -581,7 +581,10 @@ static std::string execute_command(
               }
             } else if (iequals(args[0], "INFO")) {
               std::string role = is_replica ? "slave" : "master";
-              response = encode_bulk_string("role:" + role + "\r\n");
+              std::string info = "role:" + role + "\r\n"
+                  "master_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb\r\n"
+                  "master_repl_offset:0\r\n";
+              response = encode_bulk_string(info);
             } else {
               response = "+PONG\r\n";
             }
