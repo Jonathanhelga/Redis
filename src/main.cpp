@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cerrno>
 #include <cstdint>
+#include <cctype>
 #include <fstream>
 #include <sstream>
 #include <vector>
@@ -452,10 +453,20 @@ static std::string execute_command(
     std::unordered_map<std::string, unsigned long long> &key_versions,
     std::vector<int> &replica_fds,
     long long &master_repl_offset,
-    bool is_replica)
+    bool is_replica,
+    std::unordered_map<int, std::unordered_set<std::string>> &subscriptions)
 {
   std::string response;
-            if (iequals(args[0], "ECHO") && args.size() >= 2) {
+  bool in_subscribed_mode = subscriptions.count(fd) && !subscriptions.at(fd).empty();
+  if (in_subscribed_mode &&
+      !iequals(args[0], "SUBSCRIBE") && !iequals(args[0], "UNSUBSCRIBE") &&
+      !iequals(args[0], "PSUBSCRIBE") && !iequals(args[0], "PUNSUBSCRIBE") &&
+      !iequals(args[0], "PING") && !iequals(args[0], "QUIT") && !iequals(args[0], "RESET")) {
+    std::string cmd_lower = args[0];
+    for (char &c : cmd_lower) c = (char)std::tolower((unsigned char)c);
+    response = "-ERR Can't execute '" + cmd_lower +
+        "': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context\r\n";
+  } else if (iequals(args[0], "ECHO") && args.size() >= 2) {
               response = encode_bulk_string(args[1]);
             } else if (iequals(args[0], "SET") && args.size() >= 3) {
               Entry entry;
@@ -904,6 +915,31 @@ static std::string execute_command(
                 keys.push_back(key);
               }
               response = encode_array(keys);
+            } else if (iequals(args[0], "PING")) {
+              if (in_subscribed_mode) {
+                response = "*2\r\n" + encode_bulk_string("pong") + encode_bulk_string("");
+              } else {
+                response = "+PONG\r\n";
+              }
+            } else if (iequals(args[0], "SUBSCRIBE") && args.size() >= 2) {
+              subscriptions[fd].insert(args[1]);
+              response = "*3\r\n" + encode_bulk_string("subscribe") + encode_bulk_string(args[1]) +
+                  ":" + std::to_string(subscriptions[fd].size()) + "\r\n";
+            } else if (iequals(args[0], "UNSUBSCRIBE") && args.size() >= 2) {
+              subscriptions[fd].erase(args[1]);
+              response = "*3\r\n" + encode_bulk_string("unsubscribe") + encode_bulk_string(args[1]) +
+                  ":" + std::to_string(subscriptions[fd].size()) + "\r\n";
+            } else if (iequals(args[0], "PUBLISH") && args.size() >= 3) {
+              std::string message = "*3\r\n" + encode_bulk_string("message") +
+                  encode_bulk_string(args[1]) + encode_bulk_string(args[2]);
+              int count = 0;
+              for (auto &[sub_fd, channels] : subscriptions) {
+                if (channels.count(args[1])) {
+                  send_all(sub_fd, message);
+                  ++count;
+                }
+              }
+              response = ":" + std::to_string(count) + "\r\n";
             } else {
               response = "+PONG\r\n";
             }
@@ -1026,6 +1062,8 @@ int main(int argc, char **argv) {
   std::unordered_map<std::string, unsigned long long> key_versions;
   // Per-connection set of watched keys, with the key version observed at WATCH time.
   std::unordered_map<int, std::unordered_map<std::string, unsigned long long>> watched_keys;
+  // Per-connection set of subscribed Pub/Sub channels.
+  std::unordered_map<int, std::unordered_set<std::string>> subscriptions;
 
   // AOF persistence setup: create the append-only directory/file/manifest if they
   // don't exist yet, then replay any previously-logged commands to restore state.
@@ -1063,7 +1101,7 @@ int main(int argc, char **argv) {
     while (parse_command(aof_data, rargs, consumed)) {
       if (!rargs.empty()) {
         execute_command(rargs, -1, store, lists, streams, blocked_clients, blocked_xreads,
-                         blocked_fds, key_versions, replica_fds, master_repl_offset, is_replica);
+                         blocked_fds, key_versions, replica_fds, master_repl_offset, is_replica, subscriptions);
       }
       aof_data.erase(0, consumed);
     }
@@ -1169,7 +1207,7 @@ int main(int argc, char **argv) {
                 std::string ack = encode_array({"REPLCONF", "ACK", std::to_string(replica_offset)});
                 send_all(fds[i].fd, ack);
               } else {
-                execute_command(margs, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions, replica_fds, master_repl_offset, is_replica);
+                execute_command(margs, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions, replica_fds, master_repl_offset, is_replica, subscriptions);
               }
               replica_offset += consumed;
             }
@@ -1228,7 +1266,7 @@ int main(int argc, char **argv) {
                 } else {
                   std::string results;
                   for (auto &cmd : cmds) {
-                    results += execute_command(cmd, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions, replica_fds, master_repl_offset, is_replica);
+                    results += execute_command(cmd, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions, replica_fds, master_repl_offset, is_replica, subscriptions);
                   }
                   response = "*" + std::to_string(cmds.size()) + "\r\n" + results;
                 }
@@ -1258,7 +1296,7 @@ int main(int argc, char **argv) {
               queued_commands[fds[i].fd].push_back(args);
               response = "+QUEUED\r\n";
             } else {
-              response = execute_command(args, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions, replica_fds, master_repl_offset, is_replica);
+              response = execute_command(args, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions, replica_fds, master_repl_offset, is_replica, subscriptions);
               if (is_write_command(args[0])) {
                 append_to_aof(args);
                 if (!replica_fds.empty()) {
