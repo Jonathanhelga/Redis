@@ -785,6 +785,7 @@ int main(int argc, char **argv) {
               } else {
                 multi_clients.erase(fds[i].fd);
                 queued_commands.erase(fds[i].fd);
+                watched_keys.erase(fds[i].fd);
                 response = "+OK\r\n";
               }
             } else if (iequals(args[0], "WATCH") && args.size() >= 2) {
