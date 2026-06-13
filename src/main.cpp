@@ -578,6 +578,8 @@ static std::string execute_command(
               } else {
                 response = "+PONG\r\n";
               }
+            } else if (iequals(args[0], "INFO")) {
+              response = encode_bulk_string("role:master\r\n");
             } else {
               response = "+PONG\r\n";
             }
