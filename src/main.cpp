@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -99,11 +100,110 @@ static std::string format_score(double score) {
 
 // Commands that mutate the dataset and must be propagated to connected replicas.
 static bool is_write_command(const std::string &cmd) {
-  static const char *writes[] = {"SET", "INCR", "RPUSH", "LPUSH", "LPOP", "XADD", "ZADD", "ZREM"};
+  static const char *writes[] = {"SET", "INCR", "RPUSH", "LPUSH", "LPOP", "XADD", "ZADD", "ZREM", "GEOADD"};
   for (const char *w : writes) {
     if (iequals(cmd, w)) return true;
   }
   return false;
+}
+
+// Inserts/updates `member` at `score` in a sorted set kept ordered by (score, member).
+// Returns 1 if a new member was added, 0 if an existing member's score was updated.
+static int zset_add(std::vector<std::pair<double, std::string>> &zset, double score, const std::string &member) {
+  auto it = std::find_if(zset.begin(), zset.end(),
+      [&](const auto &p) { return p.second == member; });
+  int added = 0;
+  if (it != zset.end()) {
+    zset.erase(it);
+  } else {
+    added = 1;
+  }
+  auto pos = std::lower_bound(zset.begin(), zset.end(), std::make_pair(score, member),
+      [](const auto &a, const auto &b) {
+        if (a.first != b.first) return a.first < b.first;
+        return a.second < b.second;
+      });
+  zset.insert(pos, {score, member});
+  return added;
+}
+
+static const double GEO_LAT_MIN = -85.05112878;
+static const double GEO_LAT_MAX = 85.05112878;
+static const double GEO_LON_MIN = -180.0;
+static const double GEO_LON_MAX = 180.0;
+
+// Interleaves the bits of two 32-bit values into a 64-bit geohash (y in odd bit positions).
+static uint64_t interleave64(uint32_t xlo, uint32_t ylo) {
+  static const uint64_t B[] = {0x5555555555555555ULL, 0x3333333333333333ULL,
+                                0x0F0F0F0F0F0F0F0FULL, 0x00FF00FF00FF00FFULL,
+                                0x0000FFFF0000FFFFULL};
+  static const unsigned S[] = {1, 2, 4, 8, 16};
+  uint64_t x = xlo, y = ylo;
+  for (int i = 4; i >= 0; --i) {
+    x = (x | (x << S[i])) & B[i];
+    y = (y | (y << S[i])) & B[i];
+  }
+  return x | (y << 1);
+}
+
+// Reverses interleave64, splitting a 64-bit geohash back into its two 32-bit values.
+static void deinterleave64(uint64_t interleaved, uint32_t &x_out, uint32_t &y_out) {
+  static const uint64_t B[] = {0x5555555555555555ULL, 0x3333333333333333ULL,
+                                0x0F0F0F0F0F0F0F0FULL, 0x00FF00FF00FF00FFULL,
+                                0x0000FFFF0000FFFFULL, 0x00000000FFFFFFFFULL};
+  static const unsigned S[] = {0, 1, 2, 4, 8, 16};
+  uint64_t x = interleaved;
+  uint64_t y = interleaved >> 1;
+  x &= B[0];
+  y &= B[0];
+  for (int i = 1; i <= 5; ++i) {
+    x = (x | (x >> S[i])) & B[i];
+    y = (y | (y >> S[i])) & B[i];
+  }
+  x_out = (uint32_t)x;
+  y_out = (uint32_t)y;
+}
+
+// Encodes longitude/latitude into the 52-bit geohash score Redis stores in sorted sets.
+static uint64_t geohash_encode(double longitude, double latitude) {
+  double lat_offset = (latitude - GEO_LAT_MIN) / (GEO_LAT_MAX - GEO_LAT_MIN);
+  double lon_offset = (longitude - GEO_LON_MIN) / (GEO_LON_MAX - GEO_LON_MIN);
+  uint32_t lat_bits = (uint32_t)(lat_offset * (double)(1ULL << 26));
+  uint32_t lon_bits = (uint32_t)(lon_offset * (double)(1ULL << 26));
+  return interleave64(lat_bits, lon_bits);
+}
+
+// Decodes a geohash score back into the (lossy) longitude/latitude at the center of its cell.
+static void geohash_decode(uint64_t geo_score, double &longitude, double &latitude) {
+  uint32_t lat_bits, lon_bits;
+  deinterleave64(geo_score, lat_bits, lon_bits);
+  double cell = (double)(1ULL << 26);
+  double lat_min = GEO_LAT_MIN + ((double)lat_bits / cell) * (GEO_LAT_MAX - GEO_LAT_MIN);
+  double lat_max = GEO_LAT_MIN + ((double)(lat_bits + 1) / cell) * (GEO_LAT_MAX - GEO_LAT_MIN);
+  double lon_min = GEO_LON_MIN + ((double)lon_bits / cell) * (GEO_LON_MAX - GEO_LON_MIN);
+  double lon_max = GEO_LON_MIN + ((double)(lon_bits + 1) / cell) * (GEO_LON_MAX - GEO_LON_MIN);
+  latitude = (lat_min + lat_max) / 2.0;
+  longitude = (lon_min + lon_max) / 2.0;
+}
+
+// Great-circle distance in meters between two points, using the radius Redis uses internally.
+static double haversine_distance(double lon1, double lat1, double lon2, double lat2) {
+  const double EARTH_RADIUS_M = 6372797.560856;
+  double lat1r = lat1 * M_PI / 180.0;
+  double lon1r = lon1 * M_PI / 180.0;
+  double lat2r = lat2 * M_PI / 180.0;
+  double lon2r = lon2 * M_PI / 180.0;
+  double u = std::sin((lat2r - lat1r) / 2.0);
+  double v = std::sin((lon2r - lon1r) / 2.0);
+  return 2.0 * EARTH_RADIUS_M * std::asin(std::sqrt(u * u + std::cos(lat1r) * std::cos(lat2r) * v * v));
+}
+
+// Converts a GEOSEARCH distance unit (m/km/mi/ft) to meters.
+static double geo_unit_to_meters(const std::string &unit) {
+  if (iequals(unit, "km")) return 1000.0;
+  if (iequals(unit, "mi")) return 1609.34;
+  if (iequals(unit, "ft")) return 0.3048;
+  return 1.0;
 }
 
 // The replication ID this server reports as a master.
@@ -962,22 +1062,7 @@ static std::string execute_command(
               response = ":" + std::to_string(count) + "\r\n";
             } else if (iequals(args[0], "ZADD") && args.size() >= 4) {
               double score = std::strtod(args[2].c_str(), nullptr);
-              const std::string &member = args[3];
-              auto &zset = sorted_sets[args[1]];
-              auto it = std::find_if(zset.begin(), zset.end(),
-                  [&](const auto &p) { return p.second == member; });
-              int added = 0;
-              if (it != zset.end()) {
-                zset.erase(it);
-              } else {
-                added = 1;
-              }
-              auto pos = std::lower_bound(zset.begin(), zset.end(), std::make_pair(score, member),
-                  [](const auto &a, const auto &b) {
-                    if (a.first != b.first) return a.first < b.first;
-                    return a.second < b.second;
-                  });
-              zset.insert(pos, {score, member});
+              int added = zset_add(sorted_sets[args[1]], score, args[3]);
               response = ":" + std::to_string(added) + "\r\n";
             } else if (iequals(args[0], "ZRANK") && args.size() >= 3) {
               auto sit = sorted_sets.find(args[1]);
@@ -1040,6 +1125,79 @@ static std::string execute_command(
                 }
               }
               response = ":" + std::to_string(removed) + "\r\n";
+            } else if (iequals(args[0], "GEOADD") && args.size() >= 5) {
+              double longitude = std::strtod(args[2].c_str(), nullptr);
+              double latitude = std::strtod(args[3].c_str(), nullptr);
+              bool lon_invalid = longitude < GEO_LON_MIN || longitude > GEO_LON_MAX;
+              bool lat_invalid = latitude < GEO_LAT_MIN || latitude > GEO_LAT_MAX;
+              if (lon_invalid || lat_invalid) {
+                std::string what = lon_invalid && lat_invalid ? "longitude,latitude"
+                                    : lon_invalid              ? "longitude"
+                                                                : "latitude";
+                response = "-ERR invalid " + what + " argument\r\n";
+              } else {
+                uint64_t geo_score = geohash_encode(longitude, latitude);
+                int added = zset_add(sorted_sets[args[1]], (double)geo_score, args[4]);
+                response = ":" + std::to_string(added) + "\r\n";
+              }
+            } else if (iequals(args[0], "GEOPOS") && args.size() >= 2) {
+              auto sit = sorted_sets.find(args[1]);
+              response = "*" + std::to_string(args.size() - 2) + "\r\n";
+              for (size_t i = 2; i < args.size(); ++i) {
+                std::vector<std::pair<double, std::string>>::iterator it;
+                if (sit != sorted_sets.end()) {
+                  it = std::find_if(sit->second.begin(), sit->second.end(),
+                      [&](const auto &p) { return p.second == args[i]; });
+                }
+                if (sit == sorted_sets.end() || it == sit->second.end()) {
+                  response += "*-1\r\n";
+                } else {
+                  double longitude, latitude;
+                  geohash_decode((uint64_t)it->first, longitude, latitude);
+                  char lon_buf[64], lat_buf[64];
+                  snprintf(lon_buf, sizeof(lon_buf), "%.17g", longitude);
+                  snprintf(lat_buf, sizeof(lat_buf), "%.17g", latitude);
+                  response += "*2\r\n" + encode_bulk_string(lon_buf) + encode_bulk_string(lat_buf);
+                }
+              }
+            } else if (iequals(args[0], "GEODIST") && args.size() >= 4) {
+              auto sit = sorted_sets.find(args[1]);
+              if (sit == sorted_sets.end()) {
+                response = "$-1\r\n";
+              } else {
+              auto it1 = std::find_if(sit->second.begin(), sit->second.end(),
+                  [&](const auto &p) { return p.second == args[2]; });
+              auto it2 = std::find_if(sit->second.begin(), sit->second.end(),
+                  [&](const auto &p) { return p.second == args[3]; });
+              if (it1 == sit->second.end() || it2 == sit->second.end()) {
+                response = "$-1\r\n";
+              } else {
+                double lon1, lat1, lon2, lat2;
+                geohash_decode((uint64_t)it1->first, lon1, lat1);
+                geohash_decode((uint64_t)it2->first, lon2, lat2);
+                double dist = haversine_distance(lon1, lat1, lon2, lat2);
+                char buf[64];
+                snprintf(buf, sizeof(buf), "%.4f", dist);
+                response = encode_bulk_string(buf);
+              }
+              }
+            } else if (iequals(args[0], "GEOSEARCH") && args.size() >= 8 &&
+                       iequals(args[2], "FROMLONLAT") && iequals(args[5], "BYRADIUS")) {
+              double center_lon = std::strtod(args[3].c_str(), nullptr);
+              double center_lat = std::strtod(args[4].c_str(), nullptr);
+              double radius_m = std::strtod(args[6].c_str(), nullptr) * geo_unit_to_meters(args[7]);
+              std::vector<std::string> members;
+              auto sit = sorted_sets.find(args[1]);
+              if (sit != sorted_sets.end()) {
+                for (auto &[score, member] : sit->second) {
+                  double longitude, latitude;
+                  geohash_decode((uint64_t)score, longitude, latitude);
+                  if (haversine_distance(center_lon, center_lat, longitude, latitude) <= radius_m) {
+                    members.push_back(member);
+                  }
+                }
+              }
+              response = encode_array(members);
             } else {
               response = "+PONG\r\n";
             }
