@@ -6,6 +6,7 @@
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <algorithm>
 #include <chrono>
 #include <climits>
 #include <unistd.h>
@@ -23,9 +24,10 @@ static bool set_nonblocking(int fd) {
 }
 
 // Parse a single RESP command (an array of bulk strings) from `input`.
-// On success, fills `args` with the command name + arguments and returns true.
+// On success, fills `args` with the command name + arguments, sets `consumed` to the
+// number of bytes the command occupied in `input`, and returns true.
 // Returns false if the buffer doesn't contain a complete, well-formed command.
-static bool parse_command(const std::string &input, std::vector<std::string> &args) {
+static bool parse_command(const std::string &input, std::vector<std::string> &args, size_t &consumed) {
   args.clear();
   size_t pos = 0;
   if (pos >= input.size() || input[pos] != '*') return false;
@@ -49,6 +51,7 @@ static bool parse_command(const std::string &input, std::vector<std::string> &ar
     args.push_back(input.substr(pos, len));
     pos += len + 2;  // skip data + trailing \r\n
   }
+  consumed = pos;
   return true;
 }
 
@@ -68,6 +71,15 @@ static std::string encode_array(const std::vector<std::string> &items) {
 
 static bool iequals(const std::string &a, const char *b) {
   return strcasecmp(a.c_str(), b) == 0;
+}
+
+// Commands that mutate the dataset and must be propagated to connected replicas.
+static bool is_write_command(const std::string &cmd) {
+  static const char *writes[] = {"SET", "INCR", "RPUSH", "LPUSH", "LPOP", "XADD"};
+  for (const char *w : writes) {
+    if (iequals(cmd, w)) return true;
+  }
+  return false;
 }
 
 // The replication ID this server reports as a master.
@@ -142,8 +154,20 @@ static int connect_to_master(const std::string &host, int master_port, int our_p
   recv_line(fd);
 
   send_all(fd, encode_array({"PSYNC", "?", "-1"}));
-  recv_line(fd);
+  recv_line(fd);  // +FULLRESYNC <replid> <offset>\r\n
 
+  // Consume the RDB file the master sends next: $<length>\r\n<binary contents> (no trailing \r\n).
+  std::string rdb_header = recv_line(fd);  // $<length>\r\n
+  long rdb_len = std::strtol(rdb_header.c_str() + 1, nullptr, 10);
+  long received = 0;
+  char buf[4096];
+  while (received < rdb_len) {
+    ssize_t n = recv(fd, buf, std::min((long)sizeof(buf), rdb_len - received), 0);
+    if (n <= 0) break;
+    received += n;
+  }
+
+  set_nonblocking(fd);
   return fd;
 }
 
@@ -281,6 +305,8 @@ static std::string execute_command(
     std::vector<BlockedXReadEntry> &blocked_xreads,
     std::unordered_set<int> &blocked_fds,
     std::unordered_map<std::string, unsigned long long> &key_versions,
+    std::vector<int> &replica_fds,
+    long long &master_repl_offset,
     bool is_replica)
 {
   std::string response;
@@ -668,6 +694,49 @@ static std::string execute_command(
               std::string rdb = hex_to_binary(EMPTY_RDB_HEX);
               response = "+FULLRESYNC " + MASTER_REPLID + " 0\r\n" +
                   "$" + std::to_string(rdb.size()) + "\r\n" + rdb;
+              replica_fds.push_back(fd);
+            } else if (iequals(args[0], "WAIT") && args.size() >= 3) {
+              long needed = std::strtol(args[1].c_str(), nullptr, 10);
+              long timeout_ms = std::strtol(args[2].c_str(), nullptr, 10);
+
+              if (master_repl_offset == 0) {
+                response = ":" + std::to_string(replica_fds.size()) + "\r\n";
+              } else {
+                std::string getack = encode_array({"REPLCONF", "GETACK", "*"});
+                long long target_offset = master_repl_offset;
+                for (int rfd : replica_fds) send_all(rfd, getack);
+                master_repl_offset += getack.size();
+
+                std::unordered_map<int, std::string> ack_buffers;
+                std::unordered_set<int> acked;
+                auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
+                while ((long)acked.size() < needed) {
+                  auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+                  if (remaining_ms < 0) remaining_ms = 0;
+                  std::vector<pollfd> pfds;
+                  for (int rfd : replica_fds) pfds.push_back({rfd, POLLIN, 0});
+                  int pn = poll(pfds.data(), pfds.size(), (int)remaining_ms);
+                  if (pn <= 0) break;
+                  for (auto &pf : pfds) {
+                    if (!(pf.revents & POLLIN)) continue;
+                    char buf[1024];
+                    ssize_t n = recv(pf.fd, buf, sizeof(buf), 0);
+                    if (n <= 0) continue;
+                    ack_buffers[pf.fd].append(buf, n);
+                    std::vector<std::string> rargs;
+                    size_t consumed;
+                    while (parse_command(ack_buffers[pf.fd], rargs, consumed)) {
+                      if (rargs.size() >= 3 && iequals(rargs[0], "REPLCONF") && iequals(rargs[1], "ACK")) {
+                        long long off = std::strtoll(rargs[2].c_str(), nullptr, 10);
+                        if (off >= target_offset) acked.insert(pf.fd);
+                      }
+                      ack_buffers[pf.fd].erase(0, consumed);
+                    }
+                  }
+                  if (Clock::now() >= deadline) break;
+                }
+                response = ":" + std::to_string(acked.size()) + "\r\n";
+              }
             } else {
               response = "+PONG\r\n";
             }
@@ -736,14 +805,24 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  if (is_replica) {
-    connect_to_master(master_host, master_port, port);
-  }
-
   std::cout << "Waiting for clients to connect...\n";
 
   std::vector<pollfd> fds;
   fds.push_back({server_fd, POLLIN, 0});
+
+  // Replication state.
+  int master_fd = -1;              // fd connected to our master, if we're a replica.
+  std::string master_buffer;       // buffered bytes received from the master, not yet parsed.
+  long long replica_offset = 0;    // bytes of commands processed from the master.
+  std::vector<int> replica_fds;    // fds of connected replicas (as a master).
+  long long master_repl_offset = 0;  // bytes of commands propagated to replicas.
+
+  if (is_replica) {
+    master_fd = connect_to_master(master_host, master_port, port);
+    if (master_fd >= 0) {
+      fds.push_back({master_fd, POLLIN, 0});
+    }
+  }
 
   // The key-value store, shared across all clients.
   std::unordered_map<std::string, Entry> store;
@@ -849,6 +928,40 @@ int main(int argc, char **argv) {
       bool drop = false;
       if (fds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
         drop = true;
+      } else if (fds[i].fd == master_fd && (fds[i].revents & POLLIN)) {
+        char buffer[4096];
+        int bytes_received = recv(fds[i].fd, buffer, sizeof(buffer), 0);
+        if (bytes_received > 0) {
+          master_buffer.append(buffer, bytes_received);
+          std::vector<std::string> margs;
+          size_t consumed;
+          while (parse_command(master_buffer, margs, consumed)) {
+            if (!margs.empty()) {
+              if (margs.size() >= 2 && iequals(margs[0], "REPLCONF") && iequals(margs[1], "GETACK")) {
+                std::string ack = encode_array({"REPLCONF", "ACK", std::to_string(replica_offset)});
+                send_all(fds[i].fd, ack);
+              } else {
+                execute_command(margs, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions, replica_fds, master_repl_offset, is_replica);
+              }
+              replica_offset += consumed;
+            }
+            master_buffer.erase(0, consumed);
+          }
+        } else if (bytes_received == 0) {
+          drop = true;
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+          drop = true;
+        }
+      } else if (std::find(replica_fds.begin(), replica_fds.end(), fds[i].fd) != replica_fds.end() && (fds[i].revents & POLLIN)) {
+        // Replica connections only send unsolicited bytes outside of WAIT's ack collection;
+        // drain and discard so they don't get mistaken for a regular client command.
+        char buffer[1024];
+        int bytes_received = recv(fds[i].fd, buffer, sizeof(buffer), 0);
+        if (bytes_received == 0) {
+          drop = true;
+        } else if (bytes_received < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+          drop = true;
+        }
       } else if (fds[i].revents & POLLIN) {
         char buffer[1024];
         int bytes_received = recv(fds[i].fd, buffer, sizeof(buffer), 0);
@@ -856,7 +969,8 @@ int main(int argc, char **argv) {
           std::string input(buffer, bytes_received);
           std::vector<std::string> args;
           std::string response;
-          if (parse_command(input, args) && !args.empty()) {
+          size_t consumed;
+          if (parse_command(input, args, consumed) && !args.empty()) {
             if (iequals(args[0], "MULTI")) {
               if (!multi_clients.insert(fds[i].fd).second) {
                 response = "-ERR MULTI calls can not be nested\r\n";
@@ -886,7 +1000,7 @@ int main(int argc, char **argv) {
                 } else {
                   std::string results;
                   for (auto &cmd : cmds) {
-                    results += execute_command(cmd, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions, is_replica);
+                    results += execute_command(cmd, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions, replica_fds, master_repl_offset, is_replica);
                   }
                   response = "*" + std::to_string(cmds.size()) + "\r\n" + results;
                 }
@@ -916,7 +1030,12 @@ int main(int argc, char **argv) {
               queued_commands[fds[i].fd].push_back(args);
               response = "+QUEUED\r\n";
             } else {
-              response = execute_command(args, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions, is_replica);
+              response = execute_command(args, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions, replica_fds, master_repl_offset, is_replica);
+              if (!replica_fds.empty() && is_write_command(args[0])) {
+                std::string propagated = encode_array(args);
+                for (int rfd : replica_fds) send_all(rfd, propagated);
+                master_repl_offset += propagated.size();
+              }
             }
           } else {
             response = "+PONG\r\n";
@@ -941,6 +1060,8 @@ int main(int argc, char **argv) {
         multi_clients.erase(fds[i].fd);
         queued_commands.erase(fds[i].fd);
         watched_keys.erase(fds[i].fd);
+        if (fds[i].fd == master_fd) master_fd = -1;
+        replica_fds.erase(std::remove(replica_fds.begin(), replica_fds.end(), fds[i].fd), replica_fds.end());
         close(fds[i].fd);
         fds.erase(fds.begin() + i);
       }
