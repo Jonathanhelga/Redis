@@ -1049,4 +1049,6 @@ vcpkg_installed
 # OpenCode
 .opencode/
 AGENTS.md
+instruction.md
+SESSION_HANDOFF.md
 prompt.txt

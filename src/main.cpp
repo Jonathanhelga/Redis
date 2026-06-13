@@ -70,6 +70,83 @@ static bool iequals(const std::string &a, const char *b) {
   return strcasecmp(a.c_str(), b) == 0;
 }
 
+// The replication ID this server reports as a master.
+static const std::string MASTER_REPLID = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
+
+// Hex-encoded contents of an empty RDB file, sent to replicas on full resync.
+static const std::string EMPTY_RDB_HEX =
+    "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469"
+    "732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0"
+    "c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
+
+// Decode a hex string into its raw binary representation.
+static std::string hex_to_binary(const std::string &hex) {
+  std::string out;
+  out.reserve(hex.size() / 2);
+  for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+    out.push_back(static_cast<char>(std::strtol(hex.substr(i, 2).c_str(), nullptr, 16)));
+  }
+  return out;
+}
+
+// Sends `data` in full, looping until every byte is written or the connection fails.
+static void send_all(int fd, const std::string &data) {
+  size_t sent = 0;
+  while (sent < data.size()) {
+    ssize_t n = send(fd, data.data() + sent, data.size() - sent, 0);
+    if (n <= 0) return;
+    sent += static_cast<size_t>(n);
+  }
+}
+
+// Reads bytes from `fd` one at a time until a "\r\n"-terminated line is read.
+static std::string recv_line(int fd) {
+  std::string result;
+  char c;
+  while (true) {
+    ssize_t n = recv(fd, &c, 1, 0);
+    if (n <= 0) break;
+    result += c;
+    if (result.size() >= 2 && result[result.size() - 2] == '\r' && result[result.size() - 1] == '\n')
+      break;
+  }
+  return result;
+}
+
+// Connects to the master and performs the replication handshake (PING, REPLCONF x2, PSYNC).
+// Returns the connected socket fd, or -1 on failure.
+static int connect_to_master(const std::string &host, int master_port, int our_port) {
+  struct addrinfo hints{};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  struct addrinfo *res = nullptr;
+  if (getaddrinfo(host.c_str(), std::to_string(master_port).c_str(), &hints, &res) != 0) {
+    return -1;
+  }
+
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0 || connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+    freeaddrinfo(res);
+    if (fd >= 0) close(fd);
+    return -1;
+  }
+  freeaddrinfo(res);
+
+  send_all(fd, encode_array({"PING"}));
+  recv_line(fd);
+
+  send_all(fd, encode_array({"REPLCONF", "listening-port", std::to_string(our_port)}));
+  recv_line(fd);
+
+  send_all(fd, encode_array({"REPLCONF", "capa", "psync2"}));
+  recv_line(fd);
+
+  send_all(fd, encode_array({"PSYNC", "?", "-1"}));
+  recv_line(fd);
+
+  return fd;
+}
+
 using Clock = std::chrono::steady_clock;
 
 // A stored value, with an optional expiry deadline.
@@ -582,9 +659,15 @@ static std::string execute_command(
             } else if (iequals(args[0], "INFO")) {
               std::string role = is_replica ? "slave" : "master";
               std::string info = "role:" + role + "\r\n"
-                  "master_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb\r\n"
+                  "master_replid:" + MASTER_REPLID + "\r\n"
                   "master_repl_offset:0\r\n";
               response = encode_bulk_string(info);
+            } else if (iequals(args[0], "REPLCONF")) {
+              response = "+OK\r\n";
+            } else if (iequals(args[0], "PSYNC")) {
+              std::string rdb = hex_to_binary(EMPTY_RDB_HEX);
+              response = "+FULLRESYNC " + MASTER_REPLID + " 0\r\n" +
+                  "$" + std::to_string(rdb.size()) + "\r\n" + rdb;
             } else {
               response = "+PONG\r\n";
             }
@@ -598,12 +681,19 @@ int main(int argc, char **argv) {
 
   int port = 6379;
   bool is_replica = false;
+  std::string master_host;
+  int master_port = 0;
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
       port = std::atoi(argv[++i]);
     } else if (std::strcmp(argv[i], "--replicaof") == 0 && i + 1 < argc) {
       is_replica = true;
-      ++i;
+      std::string target = argv[++i];
+      size_t space = target.find(' ');
+      if (space != std::string::npos) {
+        master_host = target.substr(0, space);
+        master_port = std::atoi(target.substr(space + 1).c_str());
+      }
     }
   }
 
@@ -644,6 +734,10 @@ int main(int argc, char **argv) {
   if (!set_nonblocking(server_fd)) {
     std::cerr << "Failed to set listener non-blocking\n";
     return 1;
+  }
+
+  if (is_replica) {
+    connect_to_master(master_host, master_port, port);
   }
 
   std::cout << "Waiting for clients to connect...\n";
