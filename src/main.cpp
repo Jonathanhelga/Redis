@@ -202,7 +202,8 @@ static std::string execute_command(
     std::unordered_map<std::string, std::vector<StreamEntry>> &streams,
     std::vector<BlockedEntry> &blocked_clients,
     std::vector<BlockedXReadEntry> &blocked_xreads,
-    std::unordered_set<int> &blocked_fds)
+    std::unordered_set<int> &blocked_fds,
+    std::unordered_map<std::string, unsigned long long> &key_versions)
 {
   std::string response;
             if (iequals(args[0], "ECHO") && args.size() >= 2) {
@@ -217,6 +218,7 @@ static std::string execute_command(
                 entry.expires_at = Clock::now() + std::chrono::milliseconds(ms);
               }
               store[args[1]] = std::move(entry);
+              ++key_versions[args[1]];
               response = "+OK\r\n";
             } else if (iequals(args[0], "GET") && args.size() >= 2) {
               auto it = store.find(args[1]);
@@ -247,12 +249,14 @@ static std::string execute_command(
                 } else {
                   val += 1;
                   it->second.value = std::to_string(val);
+                  ++key_versions[args[1]];
                   response = ":" + std::to_string(val) + "\r\n";
                 }
               } else {
                 Entry entry;
                 entry.value = "1";
                 store[args[1]] = std::move(entry);
+                ++key_versions[args[1]];
                 response = ":1\r\n";
               }
             } else if (iequals(args[0], "RPUSH") && args.size() >= 3) {
@@ -260,6 +264,7 @@ static std::string execute_command(
               for (size_t a = 2; a < args.size(); ++a) {
                 list.push_back(args[a]);
               }
+              ++key_versions[args[1]];
               response = ":" + std::to_string(list.size()) + "\r\n";
               try_unblock(args[1], lists, blocked_clients, blocked_fds);
             } else if (iequals(args[0], "LPUSH") && args.size() >= 3) {
@@ -267,6 +272,7 @@ static std::string execute_command(
               for (size_t a = 2; a < args.size(); ++a) {
                 list.insert(list.begin(), args[a]);
               }
+              ++key_versions[args[1]];
               response = ":" + std::to_string(list.size()) + "\r\n";
               try_unblock(args[1], lists, blocked_clients, blocked_fds);
             } else if (iequals(args[0], "BLPOP") && args.size() >= 3) {
@@ -279,6 +285,7 @@ static std::string execute_command(
                   std::string val = std::move(it->second.front());
                   it->second.erase(it->second.begin());
                   if (it->second.empty()) lists.erase(it);
+                  ++key_versions[key];
                   response = "*2\r\n" + encode_bulk_string(key) + encode_bulk_string(val);
                   found = true;
                   break;
@@ -309,6 +316,7 @@ static std::string execute_command(
                 std::vector<std::string> popped(it->second.begin(), it->second.begin() + count);
                 it->second.erase(it->second.begin(), it->second.begin() + count);
                 if (it->second.empty()) lists.erase(it);  // Redis deletes empty lists
+                ++key_versions[args[1]];
                 response = encode_array(popped);
               }
             } else if (iequals(args[0], "LPOP") && args.size() >= 2) {
@@ -317,6 +325,7 @@ static std::string execute_command(
                 response = encode_bulk_string(it->second.front());
                 it->second.erase(it->second.begin());
                 if (it->second.empty()) lists.erase(it);  // Redis deletes empty lists
+                ++key_versions[args[1]];
               } else {
                 response = "$-1\r\n";  // null bulk string: empty or missing list
               }
@@ -443,6 +452,7 @@ static std::string execute_command(
                     entry.fields.emplace_back(args[a], args[a + 1]);
                   }
                   streams[key].push_back(std::move(entry));
+                  ++key_versions[key];
                   response = encode_bulk_string(final_id);
                   try_unblock_xreads(key, streams, blocked_xreads, blocked_fds);
                 }
@@ -635,6 +645,10 @@ int main(int argc, char **argv) {
   // Connections that have issued MULTI and are queuing commands until EXEC/DISCARD.
   std::unordered_set<int> multi_clients;
   std::unordered_map<int, std::vector<std::vector<std::string>>> queued_commands;
+  // Bumped every time a key is written to, so WATCH can detect modifications.
+  std::unordered_map<std::string, unsigned long long> key_versions;
+  // Per-connection set of watched keys, with the key version observed at WATCH time.
+  std::unordered_map<int, std::unordered_map<std::string, unsigned long long>> watched_keys;
 
   while (true) {
     // Compute poll timeout from nearest blocked-client deadline (if any).
@@ -745,11 +759,25 @@ int main(int argc, char **argv) {
                 auto cmds = std::move(queued_commands[fds[i].fd]);
                 multi_clients.erase(fds[i].fd);
                 queued_commands.erase(fds[i].fd);
-                std::string results;
-                for (auto &cmd : cmds) {
-                  results += execute_command(cmd, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds);
+
+                bool conflict = false;
+                auto wit = watched_keys.find(fds[i].fd);
+                if (wit != watched_keys.end()) {
+                  for (const auto &[key, ver] : wit->second) {
+                    if (key_versions[key] != ver) { conflict = true; break; }
+                  }
                 }
-                response = "*" + std::to_string(cmds.size()) + "\r\n" + results;
+                watched_keys.erase(fds[i].fd);
+
+                if (conflict) {
+                  response = "*-1\r\n";
+                } else {
+                  std::string results;
+                  for (auto &cmd : cmds) {
+                    results += execute_command(cmd, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions);
+                  }
+                  response = "*" + std::to_string(cmds.size()) + "\r\n" + results;
+                }
               }
             } else if (iequals(args[0], "DISCARD")) {
               if (!multi_clients.count(fds[i].fd)) {
@@ -759,11 +787,16 @@ int main(int argc, char **argv) {
                 queued_commands.erase(fds[i].fd);
                 response = "+OK\r\n";
               }
+            } else if (iequals(args[0], "WATCH") && args.size() >= 2) {
+              for (size_t a = 1; a < args.size(); ++a) {
+                watched_keys[fds[i].fd][args[a]] = key_versions[args[a]];
+              }
+              response = "+OK\r\n";
             } else if (multi_clients.count(fds[i].fd)) {
               queued_commands[fds[i].fd].push_back(args);
               response = "+QUEUED\r\n";
             } else {
-              response = execute_command(args, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds);
+              response = execute_command(args, fds[i].fd, store, lists, streams, blocked_clients, blocked_xreads, blocked_fds, key_versions);
             }
           } else {
             response = "+PONG\r\n";
@@ -787,6 +820,7 @@ int main(int argc, char **argv) {
         }
         multi_clients.erase(fds[i].fd);
         queued_commands.erase(fds[i].fd);
+        watched_keys.erase(fds[i].fd);
         close(fds[i].fd);
         fds.erase(fds.begin() + i);
       }
