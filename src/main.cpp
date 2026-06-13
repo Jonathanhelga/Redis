@@ -751,6 +751,14 @@ int main(int argc, char **argv) {
                 }
                 response = "*" + std::to_string(cmds.size()) + "\r\n" + results;
               }
+            } else if (iequals(args[0], "DISCARD")) {
+              if (!multi_clients.count(fds[i].fd)) {
+                response = "-ERR DISCARD without MULTI\r\n";
+              } else {
+                multi_clients.erase(fds[i].fd);
+                queued_commands.erase(fds[i].fd);
+                response = "+OK\r\n";
+              }
             } else if (multi_clients.count(fds[i].fd)) {
               queued_commands[fds[i].fd].push_back(args);
               response = "+QUEUED\r\n";
